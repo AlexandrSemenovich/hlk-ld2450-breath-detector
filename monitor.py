@@ -1,23 +1,42 @@
 #!/usr/bin/env python3
-"""Live breath monitor for the HLK-LD2450 ESP32 firmware."""
+"""Live breath monitor for the HLK-LD2450 ESP32 firmware.
+
+PC-centric analysis: the ESP32 only forwards raw radar target data (plus a
+lightweight firmware BPM estimate for reference). All heavy lifting — band-pass
+filtering, FFT, SNR/quality and apnea detection — happens here in Python.
+"""
 
 import sys
+import os
 import re
 import time
+import threading
 import collections
 
 import matplotlib
-matplotlib.use("TkAgg")
+_backend = os.environ.get("MPLBACKEND")
+if _backend:
+    matplotlib.use(_backend)
+else:
+    matplotlib.use("TkAgg")
 
 import serial
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.patches as patches
 import numpy as np
-import scipy.ndimage  # Для сглаживания тепловой карты
+from scipy.signal import butter, filtfilt
+
+try:
+    import serial.tools.list_ports
+    _HAVE_LIST_PORTS = True
+except Exception:  # pragma: no cover
+    _HAVE_LIST_PORTS = False
+
 
 def find_port():
-    import serial.tools.list_ports
+    if not _HAVE_LIST_PORTS:
+        return None
     ports = list(serial.tools.list_ports.comports())
     for p in ports:
         desc = (p.description or "").lower()
@@ -25,31 +44,44 @@ def find_port():
             return p.device
     return ports[0].device if ports else None
 
-D_RE = re.compile(r"^D([-0-9.]+),([-0-9.]+),([-0-9.]+),([-0-9.]+),([01]),([01]),([01])$")
-S_RE = re.compile(r"^S([-0-9.]+),([-0-9.]+),(\d+),([01]),([01]),([01])$")
 
-WINDOW_S = 20
+D_RE = re.compile(r"^D([-0-9.]+),([-0-9.]+),([-0-9.]+),([-0-9.]+),([01]),([01]),([01]),(\d+),(\d+)$")
+S_RE = re.compile(r"^S([-0-9.]+),([-0-9.]+),(\d+),([01]),([01]),([01]),(\d+),(\d+)$")
+
+WINDOW_S = 30
 TREND_TAIL = 0.25
-READ_CHUNK = 500
+READ_CHUNK = 200
 
 # ==================== НАСТРОЙКИ КАРТЫ ====================
 LATERAL_MIN = -600       # Лимит влево (мм)
 LATERAL_MAX = 600        # Лимит вправо (мм)
-CENTER_LAT = 0            # Физический центр радара теперь строго 0
+CENTER_LAT = 0
 DEPTH_MIN = 0
-DEPTH_MAX = 1600          # Глубина обнаружения (до 3 метров)
+DEPTH_MAX = 2600         # Глубина обнаружения (до ~2.5 м)
 # =======================================================
 
 ZONE_R_MIN = 600.0
-ZONE_R_MAX = 1200.0
-ZONE_SIDE_MAX = 150.0
+ZONE_R_MAX = 2500.0
+ZONE_SIDE_MAX = 500.0
 ZONE_EDGE_POINTS = 200
 
+# Breath band (Hz) -> 7.2 .. 30 breaths/min, with margin.
+BAND_LO_HZ = 0.12
+BAND_HI_HZ = 0.5
+MIN_BPM = 5.0
+MAX_BPM = 40.0
+APNEA_S = 15.0
+SNR_THRESHOLD = 3.0
+
+
 def build_zone_patch():
-    """Математически точное построение зоны относительно центра радара"""
+    """Математически точное построение зоны относительно центра радара.
+
+    lateral = x (поперечная ось), depth = radial (sqrt(x^2+y^2)).
+    """
     xs = np.linspace(-ZONE_SIDE_MAX, ZONE_SIDE_MAX, ZONE_EDGE_POINTS)
-    inner = np.sqrt(np.maximum(0.0, ZONE_R_MIN**2 - xs**2))
-    outer = np.sqrt(np.maximum(0.0, ZONE_R_MAX**2 - xs**2))
+    inner = np.sqrt(np.maximum(0.0, ZONE_R_MIN ** 2 - xs ** 2))
+    outer = np.sqrt(np.maximum(0.0, ZONE_R_MAX ** 2 - xs ** 2))
     coords = np.column_stack([
         np.concatenate([xs, xs[::-1]]) + CENTER_LAT,
         np.concatenate([inner, outer[::-1]])
@@ -57,14 +89,83 @@ def build_zone_patch():
     return coords
 
 
+def detect_breath(ts_ms, ac):
+    """Pure PC-side breath detector (no I/O).
+
+    Resamples `ac` to a uniform grid using radar `ts_ms`, applies a Butterworth
+    band-pass, then an FFT peak search in the breathing band. Returns
+    (bpm, detected, quality, snr). bpm is 0.0 when breathing is not detected.
+    """
+    ts = np.asarray(ts_ms, dtype=float)
+    signal = np.asarray(ac, dtype=float)
+    if ts.size < 2 or signal.size < 2:
+        return 0.0, False, 0.0, 0.0
+
+    t0 = ts[0]
+    tt = (ts - t0) / 1000.0
+    duration = float(tt[-1] - tt[0])
+    if duration < 5.0:
+        return 0.0, False, 0.0, 0.0
+
+    dt = np.diff(ts)
+    dt = dt[dt > 0]
+    fs = 1000.0 / float(np.median(dt)) if dt.size else 10.0
+    if fs <= 0.0:
+        return 0.0, False, 0.0, 0.0
+
+    t_uni = np.arange(0.0, duration, 1.0 / fs)
+    if t_uni.size < 8:
+        return 0.0, False, 0.0, 0.0
+    sig_u = np.interp(t_uni, tt, signal)
+    sig_u = sig_u - np.mean(sig_u)
+
+    nyq = fs / 2.0
+    lo = max(BAND_LO_HZ / nyq, 1e-4)
+    hi = min(BAND_HI_HZ / nyq, 0.99)
+    b, a = butter(2, [lo, hi], btype="band")
+    filt = filtfilt(b, a, sig_u)
+
+    spectrum = np.fft.rfft(filt * np.hanning(filt.size))
+    freqs = np.fft.rfftfreq(filt.size, d=1.0 / fs)
+    mag = np.abs(spectrum)
+    if np.max(mag) > 0.0:
+        mag = mag / np.max(mag)
+
+    band_mask = (freqs >= BAND_LO_HZ) & (freqs <= BAND_HI_HZ)
+    if not np.any(band_mask):
+        return 0.0, False, 0.0, 0.0
+
+    band_freqs = freqs[band_mask]
+    band_mag = mag[band_mask]
+    peak_idx = int(np.argmax(band_mag))
+    peak_freq = float(band_freqs[peak_idx])
+    peak_amp = float(band_mag[peak_idx])
+
+    no_peak = np.ones(band_mag.size, dtype=bool)
+    no_peak[max(0, peak_idx - 2):peak_idx + 3] = False
+    rest = band_mag[no_peak]
+    noise_floor = float(np.median(rest)) if rest.size else band_mag.min()
+    snr = peak_amp / max(noise_floor, 1e-3)
+
+    bpm = peak_freq * 60.0
+    detected = (snr > SNR_THRESHOLD) and (MIN_BPM < bpm < MAX_BPM)
+    quality = float(np.clip(100.0 * snr / (snr + 3.0), 0.0, 100.0))
+
+    if not detected:
+        bpm = 0.0
+    return bpm, detected, quality, snr
+
+
 class Monitor:
     def __init__(self, port, baud):
-        self.ser = serial.Serial(port, baud, timeout=0.02)
-        self.times = collections.deque(maxlen=1000)
-        self.dist = collections.deque(maxlen=1000)
-        self.ac = collections.deque(maxlen=1000)
-        self.depth = collections.deque(maxlen=1000)
-        self.lateral = collections.deque(maxlen=1000)
+        self.ser = serial.Serial(port, baud, timeout=0.05)
+        self.lock = threading.Lock()
+        self.times = collections.deque(maxlen=2000)
+        self.dist = collections.deque(maxlen=2000)
+        self.ac = collections.deque(maxlen=2000)
+        self.depth = collections.deque(maxlen=2000)
+        self.lateral = collections.deque(maxlen=2000)
+        self.tsms = collections.deque(maxlen=2000)
         self.bpm = self.amp = self.q = 0.0
         self.visible = False
         self.in_zone = False
@@ -72,7 +173,12 @@ class Monitor:
         self.last_valid_breath_time = None
         self.apnea_detected = False
         self.start = time.time()
+        self._stop = False
+        self.last_frame_id = 0
+        self.dropped = 0
         self._sync()
+        self.thread = threading.Thread(target=self.reader, daemon=True)
+        self.thread.start()
 
     def _sync(self):
         self.ser.reset_input_buffer()
@@ -82,140 +188,98 @@ class Monitor:
             if "ready" in line:
                 return
 
-    def poll(self):
-        for _ in range(READ_CHUNK):
+    def reader(self):
+        while not self._stop:
             try:
                 line = self.ser.readline().decode(errors="ignore").strip()
             except (serial.SerialException, OSError):
-                raise
-            except Exception:
                 break
             if not line:
-                break
+                continue
+            self._handle(line)
 
-            m = D_RE.match(line)
-            if m:
-                try:
-                    dist = float(m.group(1))
-                    acv = float(m.group(2))
-                    depth_val = float(m.group(3))
-                    lateral_val = float(m.group(4))
-                    
-                    # Если латераль равна глубине (баг) или выходит за границы,
-                    # используем последнюю известную достоверную координату (Zero-Order Hold).
-                    # не ломает временной ряд и не телепортирует объект ложно.
-                    if abs(lateral_val - depth_val) < 1e-3 or lateral_val > LATERAL_MAX or lateral_val < LATERAL_MIN:
-                        lateral_val = self.lateral[-1] if self.lateral else CENTER_LAT
-                        depth_val = self.depth[-1] if self.depth else 0.0
+    def _handle(self, line):
+        m = D_RE.match(line)
+        if m:
+            try:
+                dist = float(m.group(1))
+                acv = float(m.group(2))
+                depth_val = float(m.group(3))
+                lateral_val = float(m.group(4))
+                ts_ms = int(m.group(8))
+                frame_id = int(m.group(9))
 
-                    self.visible = (m.group(5) == "1")
-                    self.in_zone = (m.group(6) == "1")
-                    self.stationary = (m.group(7) == "1")
-                except ValueError:
-                    continue
+                # Zero-Order-Hold защита от выбросов/багов координат.
+                if lateral_val > LATERAL_MAX or lateral_val < LATERAL_MIN or depth_val < DEPTH_MIN:
+                    lateral_val = self.lateral[-1] if self.lateral else CENTER_LAT
+                    depth_val = self.depth[-1] if self.depth else 0.0
 
+                visible = (m.group(5) == "1")
+                in_zone = (m.group(6) == "1")
+                stationary = (m.group(7) == "1")
+            except ValueError:
+                return
+
+            with self.lock:
                 now = time.time() - self.start
+                # Детект пропущенных кадров.
+                if self.last_frame_id and frame_id != self.last_frame_id + 1:
+                    self.dropped += (frame_id - self.last_frame_id - 1)
+                self.last_frame_id = frame_id
+
                 self.times.append(now)
                 self.dist.append(dist)
                 self.ac.append(acv)
                 self.depth.append(max(0.0, depth_val))
                 self.lateral.append(lateral_val)
+                self.tsms.append(ts_ms)
+                self.visible = visible
+                self.in_zone = in_zone
+                self.stationary = stationary
 
                 while self.times and self.times[0] < now - WINDOW_S:
-                    for dq in (self.times, self.dist, self.ac, self.depth, self.lateral):
+                    for dq in (self.times, self.dist, self.ac, self.depth, self.lateral, self.tsms):
                         dq.popleft()
-                continue
+            return
 
-            s = S_RE.match(line)
-            if s:
-                try:
+        s = S_RE.match(line)
+        if s:
+            try:
+                with self.lock:
                     self.bpm = float(s.group(1))
                     self.amp = float(s.group(2))
                     self.q = float(s.group(3))
                     self.visible = (s.group(4) == "1")
                     self.in_zone = (s.group(5) == "1")
                     self.stationary = (s.group(6) == "1")
-                except ValueError:
-                    continue
+            except ValueError:
+                return
+
+    def poll(self):
+        """Deprecated: data is now collected by the reader thread."""
+        pass
 
     def analyze_breath_fft(self):
-        if not self.in_zone:
-            self.last_valid_breath_time = None
-            self.apnea_detected = False
-            return 0.0, False, False, 0.0
+        with self.lock:
+            if not self.in_zone or len(self.ac) < 2 or len(self.tsms) < 2:
+                self.last_valid_breath_time = None
+                self.apnea_detected = False
+                return 0.0, False, False, 0.0
+            ts = list(self.tsms)
+            ac = list(self.ac)
 
-        if not self.times or not self.ac:
-            return 0.0, False, False, 0.0
+        bpm, detected, quality, snr = detect_breath(ts, ac)
 
-        ts = np.array(self.times, dtype=float)
-        signal = np.array(self.ac, dtype=float)
-        if signal.size < 2 or ts.size < 2:
-            return 0.0, False, False, 0.0
-
-        n = min(ts.size, signal.size)
-        ts = ts[-n:]
-        signal = signal[-n:]
-
-        duration = float(ts[-1] - ts[0])
-        if duration < 5.0:
-            return 0.0, False, False, 0.0
-
-        signal = signal - np.mean(signal)
-        if np.max(np.abs(signal)) < 1e-6:
-            return 0.0, False, False, 0.0
-
-        window = np.hanning(signal.size)
-        signal_win = signal * window
-
-        dt = np.diff(ts)
-        dt = dt[dt > 0.0]
-        fs = 1.0 / np.median(dt) if dt.size else signal.size / max(duration, 1e-6)
-
-        if fs <= 0.0:
-            return 0.0, False, False, 0.0
-
-        spectrum = np.fft.rfft(signal_win)
-        freqs = np.fft.rfftfreq(signal_win.size, d=1.0 / fs)
-        mag = np.abs(spectrum)
-        if np.max(mag) > 0.0:
-            mag = mag / np.max(mag)
-
-        band_mask = (freqs >= 0.1) & (freqs <= 0.5)
-        if not np.any(band_mask):
-            return 0.0, False, False, 0.0
-
-        band_mag = mag[band_mask]
-        peak_idx = int(np.argmax(band_mag))
-        peak_freq = float(freqs[band_mask][peak_idx])
-        peak_amp = float(band_mag[peak_idx])
-
-        nonzero = band_mag[band_mag > 0.0]
-        noise_floor = float(np.median(nonzero)) if nonzero.size else 0.0
-        adaptive_threshold = max(0.15, 3.0 * max(noise_floor, 1e-3))
-
-        bpm = peak_freq * 60.0
-        breathing_detected = peak_amp > adaptive_threshold and 5.0 < bpm < 40.0
-
-        filtered_mag = mag.copy()
-        filtered_mag[~band_mask] = 0.0
-        energy_total = float(np.sum(mag ** 2))
-        energy_breath = float(np.sum(filtered_mag[band_mask] ** 2))
-        quality = 100.0 * energy_breath / energy_total if energy_total > 0.0 else 0.0
-        quality = float(np.clip(quality, 0.0, 100.0))
-
-        current_time = float(ts[-1])
-        if breathing_detected:
+        current_time = time.time() - self.start
+        if detected:
             self.last_valid_breath_time = current_time
             self.apnea_detected = False
         elif self.last_valid_breath_time is None:
-            self.apnea_detected = current_time > 15.0
+            self.apnea_detected = current_time > APNEA_S
         else:
-            self.apnea_detected = (current_time - self.last_valid_breath_time) > 15.0
+            self.apnea_detected = (current_time - self.last_valid_breath_time) > APNEA_S
 
-        if not breathing_detected:
-            bpm = 0.0
-
-        return bpm, breathing_detected, self.apnea_detected, quality
+        return bpm, detected, self.apnea_detected, quality
 
     def baseline(self):
         d = list(self.dist)
@@ -242,7 +306,6 @@ def main():
     )
     fig.suptitle("HLK-LD2450 Breath Monitor — Scientific View", fontsize=14, fontweight='bold')
 
-    # Оформление графиков сигналов
     line_dist, = ax_wave.plot([], [], lw=1.2, color="#2c7fb8", label="Distance (mm)")
     line_trend, = ax_wave.plot([], [], lw=1.5, color="#d95f02", ls="--", label="Baseline")
     ax_wave.set_ylabel("Distance (mm)")
@@ -257,14 +320,10 @@ def main():
     ax_breath.legend(loc="upper right", fontsize=10)
     ax_breath.grid(True, alpha=0.5, linestyle='--')
 
-    # ==================== НАУЧНАЯ ТЕПЛОВАЯ КАРТА ====================
-    # Изменен aspect="auto" для растягивания по ширине окна
     heat_img = ax_heat.imshow(
         np.zeros((100, 100)), origin="lower", cmap="inferno", aspect="auto",
         extent=[LATERAL_MIN, LATERAL_MAX, DEPTH_MIN, DEPTH_MAX], interpolation='nearest'
     )
-    
-    # Добавление цветовой шкалы (colorbar) для строгой оценки
     cbar = fig.colorbar(heat_img, ax=ax_heat, fraction=0.046, pad=0.04)
     cbar.set_label('Position Density', rotation=270, labelpad=15)
 
@@ -290,7 +349,6 @@ def main():
     heat_marker, = ax_heat.plot([], [], marker='o', markersize=16,
                                 markerfacecolor='#00ff00', markeredgecolor='white', markeredgewidth=2)
 
-    # Гистограмма ЧДД
     bar = ax_bar.barh(["BPM (FFT)"], [0], color="#41ab5d")
     ax_bar.set_xlim(0, 40)
     ax_bar.set_xlabel("Breaths / Min")
@@ -298,8 +356,8 @@ def main():
 
     txt_stat = fig.text(0.02, 0.96, "", fontsize=11, family='monospace',
                         bbox=dict(boxstyle="round,pad=0.5", fc="#f8f9fa", ec="#dee2e6", alpha=0.95))
-    
-    plt.tight_layout(rect=[0, 0, 1, 0.95]) # Оптимизация отступов
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
 
     def update(_):
         nonlocal breath_fill
@@ -310,17 +368,22 @@ def main():
         mon.poll()
         py_bpm, detected, apnea, quality = mon.analyze_breath_fft()
 
-        if not mon.times:
-            return line_dist, line_trend, line_ac, bar, heat_img, heat_marker
+        with mon.lock:
+            if not mon.times:
+                return line_dist, line_trend, line_ac, bar, heat_img, heat_marker
+            t = list(mon.times)
+            d = list(mon.dist)
+            a = list(mon.ac)
+            depth = list(mon.depth)
+            lateral = list(mon.lateral)
+            in_zone = mon.in_zone
+            visible = mon.visible
+            stationary = mon.stationary
+            fw_bpm = mon.bpm
+            dropped = mon.dropped
 
-        t = list(mon.times)
-        d = list(mon.dist)
-        a = list(mon.ac)
-        depth = list(mon.depth)
-        lateral = list(mon.lateral)
         tr = mon.baseline()
 
-        # Обновление графиков
         line_dist.set_data(t, d)
         line_trend.set_data(t, tr)
         line_ac.set_data(t, a)
@@ -338,53 +401,51 @@ def main():
         ax_breath.set_xlim(max(0, t[0]), max(t[-1], 1))
 
         line_ac.set_color("#2ca25f" if detected else "#adb5bd")
-        
         if a and t:
             breath_fill = ax_breath.fill_between(t, a, 0, color="#2ca25f" if detected else "#adb5bd", alpha=0.15)
 
-        # Вычисление сглаженной тепловой карты
         if depth and lateral:
             depth_arr = np.clip(depth, DEPTH_MIN, DEPTH_MAX)
             lateral_arr = np.clip(lateral, LATERAL_MIN, LATERAL_MAX)
-
-            # Создаем 2D гистограмму (матрица 100x100)
             heat_raw, _, _ = np.histogram2d(
                 lateral_arr, depth_arr, bins=100,
                 range=[[LATERAL_MIN, LATERAL_MAX], [DEPTH_MIN, DEPTH_MAX]]
             )
-            
-            # Применяем Гауссово размытие для визуальной эстетики (настоящий Heatmap)
-            heat_smooth = scipy.ndimage.gaussian_filter(heat_raw, sigma=1.8)
-
+            heat_smooth = scipy_gaussian(heat_raw, sigma=1.8)
             heat_img.set_data(heat_smooth.T)
             vmax = max(0.1, np.max(heat_smooth))
             heat_img.set_clim(0, vmax)
-
-            last_lat = lateral_arr[-1]
-            last_dep = depth_arr[-1]
-            heat_marker.set_data([last_lat], [last_dep])
-            heat_marker.set_markerfacecolor('#00ff00' if mon.in_zone else '#ffae00')
+            heat_marker.set_data([lateral_arr[-1]], [depth_arr[-1]])
+            heat_marker.set_markerfacecolor('#00ff00' if in_zone else '#ffae00')
         else:
             heat_img.set_data(np.zeros((100, 100)))
             heat_marker.set_data([], [])
 
-        # Информационная панель
-        tracking_state = "TRACKING" if mon.in_zone and mon.visible else ("VISIBLE" if mon.visible else "NO TARGET")
+        tracking_state = "TRACKING" if in_zone and visible else ("VISIBLE" if visible else "NO TARGET")
         bg_color = "#ffe3e3" if apnea else "#f8f9fa"
         txt_stat.set_bbox(dict(boxstyle="round,pad=0.5", fc=bg_color, ec="#dee2e6", alpha=0.95))
-        
+
         txt_stat.set_text(
-            f"SYSTEM STATE : {tracking_state:<10} | STATIONARY: {'YES' if mon.stationary else 'NO':<3} | APNEA: {'DETECTED ⚠️' if apnea else 'OK'}\n"
-            f"ALGORITHM    : FW BPM = {mon.bpm:>4.1f} | PY BPM (FFT) = {py_bpm:>4.1f} \n"
-            f"SIGNAL METRIC: BREATHING = {'YES' if detected else 'NO':<3} | QUALITY = {quality:>5.1f}%"
+            f"SYSTEM STATE : {tracking_state:<10} | STATIONARY: {'YES' if stationary else 'NO':<3} | APNEA: {'DETECTED' if apnea else 'OK'}\n"
+            f"ALGORITHM    : FW BPM = {fw_bpm:>4.1f} | PY BPM (FFT) = {py_bpm:>4.1f} \n"
+            f"SIGNAL METRIC: BREATHING = {'YES' if detected else 'NO':<3} | QUALITY = {quality:>5.1f}% | DROPPED = {dropped}"
         )
 
         bar[0].set_width(py_bpm if detected else 0)
 
         return line_dist, line_trend, line_ac, bar, heat_img, heat_marker
 
-    ani = animation.FuncAnimation(fig, update, interval=33, blit=False, cache_frame_data=False)
+    ani = animation.FuncAnimation(fig, update, interval=50, blit=False, cache_frame_data=False)
     plt.show()
+
+
+def scipy_gaussian(arr, sigma=1.8):
+    try:
+        from scipy.ndimage import gaussian_filter
+        return gaussian_filter(arr, sigma=sigma)
+    except Exception:
+        return arr
+
 
 if __name__ == "__main__":
     try:

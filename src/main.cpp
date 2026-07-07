@@ -15,56 +15,37 @@ static constexpr uint32_t PC_BAUD       = 921600;
 #define DEBUG 1
 #endif
 
-static constexpr int16_t  MOTION_SPEED_CMS = 60;
+// Radar reports at ~10 Hz (datasheet). Used only for coarse guards.
 static constexpr uint32_t FRAME_TIMEOUT_MS = 1000;
 static constexpr uint32_t SUMMARY_MS = 500;
-static constexpr float    STATIONARY_SPEED_THRESHOLD = 80.0f;
 
-
+// Target validity / selection
 static constexpr float    VALID_R_MIN = 100.0f;
 static constexpr float    VALID_R_MAX = 6000.0f;
-
-static constexpr float    ZONE_R_MIN = 200.0f;
-static constexpr float    ZONE_R_MAX = 2500.0f;
+static constexpr float    ZONE_R_MIN  = 600.0f;
+static constexpr float    ZONE_R_MAX  = 2500.0f;
 static constexpr float    ZONE_SIDE_MAX = 500.0f;
+static constexpr float    STATIONARY_SPEED_THRESHOLD = 80.0f;  // cm/s
 
 HardwareSerial radarSerial(2);
 
-static ld2450::Parser      parser;
-static ld2450::Frame       dbg_last_frame{};
-static breath::Detector    detector({});
-static int16_t             locked_index = -1;
-static uint32_t            last_frame_ms = 0;
-static uint32_t            last_summary_ms = 0;
-
-// Debug
-static uint32_t dbg_bytes = 0, dbg_frames = 0, dbg_samples = 0;
+static ld2450::Parser   parser;
+static breath::Detector detector({});
+static int16_t          locked_index = -1;
+static uint32_t         last_frame_ms = 0;
+static uint32_t         frame_counter = 0;
 
 // Helpers
 static float safe_sqrt(float x) { return x > 0 ? sqrtf(x) : 0.0f; }
 
+// Radial (breath) distance from the radar to the target.
 static float radial(const ld2450::Target& t) {
   return safe_sqrt(static_cast<float>(t.x) * t.x + static_cast<float>(t.y) * t.y);
 }
 
-static float computeDistAndDepth(const ld2450::Target& t, float& out_depth) {
-  float x = fabsf(static_cast<float>(t.x));   // берём модуль
-  float y = static_cast<float>(t.y);
-  float r = safe_sqrt(x*x + y*y);
-
-  if (fabs(y) < 120.0f) {
-    out_depth = r;                    // теперь почти = dist
-  } else {
-    out_depth = y;
-  }
-
-  // Защита от совсем плохих значений
-  if (r < 150.0f) {
-    r = 1000.0f;
-    out_depth = 950.0f;
-  }
-
-  return r;
+// Lateral (cross-range) component — signed x axis.
+static float lateralOf(const ld2450::Target& t) {
+  return static_cast<float>(t.x);
 }
 
 static bool isPresent(const ld2450::Target& t) {
@@ -77,14 +58,21 @@ static bool inZone(const ld2450::Target& t) {
   return (r >= ZONE_R_MIN && r <= ZONE_R_MAX && fabsf(t.x) <= ZONE_SIDE_MAX);
 }
 
+// Pick the best target for breathing analysis:
+//   - prefer the previously locked target if still valid and stationary in zone
+// Selection priority:
+//   1) keep the previously locked target if still breath-ready
+//   2) closest stationary target inside the zone (breath-ready)
+//   3) fallback: closest present target (so the PC can show/aim it)
 static int16_t pickTarget(const ld2450::Frame& f, int16_t locked) {
   if (locked >= 0) {
     for (uint8_t i = 0; i < f.count; i++) {
-      if (f.targets[i].index == locked && isPresent(f.targets[i]) && inZone(f.targets[i])) {
+      const auto& t = f.targets[i];
+      if (t.index == locked && isPresent(t) && inZone(t) &&
+          fabsf(t.speed) < STATIONARY_SPEED_THRESHOLD) {
         return i;
       }
     }
-    return -1;
   }
 
   int16_t best = -1;
@@ -92,7 +80,22 @@ static int16_t pickTarget(const ld2450::Frame& f, int16_t locked) {
   for (uint8_t i = 0; i < f.count; i++) {
     const auto& t = f.targets[i];
     if (!isPresent(t) || !inZone(t)) continue;
-    float score = (abs(t.speed) < MOTION_SPEED_CMS) ? radial(t) : 1e9f;
+    if (fabsf(t.speed) >= STATIONARY_SPEED_THRESHOLD) continue;  // need a still chest
+    float score = radial(t);
+    if (score < best_score) {
+      best_score = score;
+      best = i;
+    }
+  }
+  if (best >= 0) return best;
+
+  // Fallback: nearest present target (used for aiming/debugging on the PC).
+  best = -1;
+  best_score = 1e12f;
+  for (uint8_t i = 0; i < f.count; i++) {
+    const auto& t = f.targets[i];
+    if (!isPresent(t)) continue;
+    float score = radial(t);
     if (score < best_score) {
       best_score = score;
       best = i;
@@ -108,59 +111,50 @@ static void pollRadar(uint32_t now) {
 
   while (radarSerial.available()) {
     parser.feed(radarSerial.read());
-    dbg_bytes++;
   }
 
   ld2450::Frame f;
   while (parser.drain(f)) {
     if (!f.valid) continue;
-    
-    last_frame_ms = now;
-    dbg_frames++;
-    dbg_last_frame = f;        // теперь должно работать
 
-    // === Упрощённый выбор цели ===
-    int16_t sel = -1;
-    for (uint8_t i = 0; i < f.count; i++) {
-      if (f.targets[i].x != 0 || f.targets[i].y != 0) {
-        sel = i;
-        break;
-      }
-    }
+    last_frame_ms = now;
+
+    int16_t sel = pickTarget(f, locked_index);
 
     if (sel >= 0) {
       const auto& t = f.targets[sel];
-      float depth = static_cast<float>(t.x);
-      float dist = computeDistAndDepth(t, depth);
-      float lateral = static_cast<float>(t.y);
+      float depth     = radial(t);                 // breath axis (mm)
+      float lateral   = lateralOf(t);              // cross-range (mm)
+      bool  stationary = fabsf(t.speed) < STATIONARY_SPEED_THRESHOLD;
+      bool  in_zone    = inZone(t);
 
-      bool stationary = fabsf(t.speed) < 150;
+      // Only feed the breath detector with a still target inside the zone.
+      if (in_zone && stationary) {
+        detector.push(depth, now);
+      } else {
+        detector.reset();
+      }
 
-      detector.push(dist, now);
-
-      bridge::sendSample(dist, detector.ac(), depth, lateral, true, true, stationary);
-
-      Serial.printf("# PROCESS: x=%d y=%d → dist=%.1f depth=%.1f lat=%.1f ac=%.2f\n", 
-                    t.x, t.y, dist, depth, lateral, detector.ac());
-
+      bridge::sendSample(depth, detector.ac(), depth, lateral,
+                         true, in_zone, stationary, now, ++frame_counter);
       locked_index = t.index;
-      dbg_samples++;
       continue;
     }
 
-    // Нет цели
+    // No suitable target.
     if (locked_index != -1) {
       detector.reset();
       locked_index = -1;
     }
-    bridge::sendSample(0.0f, 0.0f, 0.0f, 0.0f, false, false, false);
+    bridge::sendSample(0.0f, 0.0f, 0.0f, 0.0f,
+                       false, false, false, now, ++frame_counter);
   }
 }
 
 void setup() {
   bridge::begin(PC_BAUD);
   radarSerial.begin(LD2450_BAUD, SERIAL_8N1, LD2450_RX_PIN, LD2450_TX_PIN);
-  Serial.println("ESP32 LD2450 Breath Detector v2 - Depth Fix");
+  Serial.println("ESP32 LD2450 Breath Detector v3 - transparent forwarder");
 }
 
 void loop() {
@@ -170,6 +164,6 @@ void loop() {
   uint32_t now = millis();
   if (now - last_summary >= SUMMARY_MS) {
     last_summary = now;
-    bridge::sendSummary(detector.update(now), false, false, false); // упрощённо
+    bridge::sendSummary(detector.update(now), false, false, false, now, frame_counter);
   }
 }

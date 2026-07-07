@@ -1,4 +1,3 @@
-#include <Arduino.h>
 #include "ld2450_parser.h"
 #include <cstring>
 
@@ -14,20 +13,23 @@ void Parser::feed(uint8_t b) {
   }
 }
 
-// Per datasheet: signed int16, MSB (0x8000) is the sign bit.
-//   MSB set   -> positive value, magnitude = raw & 0x7FFF
-//   MSB clear -> negative value, magnitude = raw & 0x7FFF
-// Example: 0x0E03 = 782 -> negative -> -782 mm
-//          0x86B1 = 34481 -> positive -> 34481 - 32768 = 1713 mm
+// LD2450 emits x, y and speed using signed-magnitude encoding:
+//   magnitude = raw & 0x7FFF, sign in bit15 (0x8000).
+// IMPORTANT: a plain int16_t(raw) cast is WRONG here — it turns valid
+// coordinates into huge out-of-range values and breaks target selection
+// (everything decodes to 0 / no target). This signed-magnitude decode is
+// symmetric (bit15=1 -> positive, bit15=0 -> negative); a target on the
+// opposite side of the sensor flips the sign. If your mounting mirrors
+// left/right, flip the sign in both functions (one line each).
 int16_t Parser::decodeCoord(uint16_t raw) {
   const int16_t mag = static_cast<int16_t>(raw & 0x7FFF);
-  return (raw & 0x8000) ? mag : static_cast<int16_t>(-mag); // Верни как было!
+  return (raw & 0x8000) ? mag : static_cast<int16_t>(-mag);
 }
 
-// Speed shares the same sign encoding as coordinates (unit cm/s).
+// Speed uses the same signed-magnitude encoding (unit cm/s).
 int16_t Parser::decodeSpeed(uint16_t raw) {
   const int16_t mag = static_cast<int16_t>(raw & 0x7FFF);
-  return (raw & 0x8000) ? static_cast<int16_t>(-mag) : mag;
+  return (raw & 0x8000) ? mag : static_cast<int16_t>(-mag);
 }
 
 bool Parser::drain(Frame& out) {
@@ -40,14 +42,12 @@ bool Parser::drain(Frame& out) {
     return false;
   }
 
-  // Number of targets. The real module emits a fixed 3-target frame; some
-  // bytes at this position can be garbage on a desync, so clamp to a valid
-  // range to avoid an absurd frame length (which would stall the parser).
-  uint8_t nTargets = buf_[4];
-  if (nTargets < 1 || nTargets > MAX_TARGETS) nTargets = MAX_TARGETS;
-
-  uint16_t need = static_cast<uint16_t>(6 + nTargets * 8);  // hdr+len+reserved+targets+tail
-  if (len_ < need) return false;                            // wait for full frame
+  // The LD2450 emits a fixed 30-byte frame: 4-byte header, then 3 targets
+  // (8 bytes each, first target at offset 4), then a 55 CC tail. There is NO
+  // separate nTargets/reserved byte on the wire — this matches LD2450.cpp.
+  const uint8_t nTargets = MAX_TARGETS;                          // 3
+  const uint16_t need = static_cast<uint16_t>(4 + nTargets * 8 + 2);  // 30
+  if (len_ < need) return false;                                // wait for full frame
 
   // Tail: 55 CC
   if (buf_[need - 2] != 0x55 || buf_[need - 1] != 0xCC) {
@@ -55,19 +55,15 @@ bool Parser::drain(Frame& out) {
     return false;
   }
 
-for (uint8_t i = 0; i < nTargets; i++) {
-    uint16_t o = static_cast<uint16_t>(6 + i * 8);
+  for (uint8_t i = 0; i < nTargets; i++) {
+    const uint16_t o = static_cast<uint16_t>(4 + i * 8);        // first target at offset 4
     Target& t = out.targets[i];
-    
+
     t.x           = decodeCoord(static_cast<uint16_t>(buf_[o]     | (buf_[o + 1] << 8)));
     t.y           = decodeCoord(static_cast<uint16_t>(buf_[o + 2] | (buf_[o + 3] << 8)));
     t.speed       = decodeSpeed(static_cast<uint16_t>(buf_[o + 4] | (buf_[o + 5] << 8)));
     t.distance_res = static_cast<uint16_t>(buf_[o + 6] | (buf_[o + 7] << 8));
     t.index       = i;
-
-    // Отладка
-    Serial.printf("Parsed target %d: x=%d y=%d speed=%d res=%u\n", 
-                  i, t.x, t.y, t.speed, t.distance_res);
   }
   out.count = nTargets;
   out.valid = true;

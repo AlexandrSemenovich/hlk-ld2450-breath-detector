@@ -23,8 +23,8 @@ struct Config {
   Config()
       : lp_alpha(0.15f),
         trend_tau_ms(6000),
-        zc_min_period(1200),
-        zc_max_period(20000),
+        zc_min_period(1000),   // 60 bpm upper bound
+        zc_max_period(15000),  // 4 bpm lower bound
         history_s(20) {}
 };
 
@@ -55,7 +55,7 @@ class Detector {
   void reset();
 
  private:
-  uint16_t historySize() const { return cfg_.history_s * 20u; }  // ~20 Hz assumption
+  uint16_t historySize() const { return cfg_.history_s * 10u; }  // ~10 Hz (LD2450 datasheet)
 
   const Config cfg_;
 

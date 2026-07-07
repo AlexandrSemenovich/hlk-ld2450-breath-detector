@@ -1,0 +1,59 @@
+// Standalone C++ test for the breath detector (no Arduino, no Unity).
+// Build with the native PlatformIO env: `pio run -e native`, then run
+// `.pio\build\native\program.exe`. Or compile directly with g++:
+//   g++ -std=c++17 -I src cpp_test/test_main.cpp src/breath_detector.cpp -o cpp_test.exe && cpp_test.exe
+#include <cstdio>
+#include <cmath>
+#include "../src/breath_detector.cpp"
+
+static int g_failures = 0;
+
+#define CHECK(cond, msg)                                          \
+  do {                                                            \
+    if (!(cond)) {                                                \
+      printf("  FAIL: %s\n", msg);                                \
+      g_failures++;                                               \
+    } else {                                                      \
+      printf("  ok:   %s\n", msg);                                \
+    }                                                             \
+  } while (0)
+
+static void test_breathing_sine() {
+  printf("[test] breathing sine (15 bpm)\n");
+  breath::Detector d({});
+  const float amp = 8.0f;     // mm, comparable to real breath amplitude
+  const float f_hz = 0.25f;   // 15 breaths/min
+  uint32_t now = 0;
+  for (int i = 0; i < 400; i++) {            // 40 s @ 10 Hz
+    float t = now / 1000.0f;
+    float dist = 1000.0f + amp * sinf(2.0f * 3.14159265f * f_hz * t);
+    d.push(dist, now);
+    now += 100;
+  }
+  breath::Result r = d.update(now);
+  CHECK(fabsf(r.bpm - 15.0f) < 4.0f, "estimated bpm near 15");
+  CHECK(r.quality > 0.0f, "quality > 0 for clean signal");
+}
+
+static void test_flat_no_breath() {
+  printf("[test] flat signal (no breath)\n");
+  breath::Detector d({});
+  uint32_t now = 0;
+  for (int i = 0; i < 400; i++) {
+    d.push(1000.0f, now);
+    now += 100;
+  }
+  breath::Result r = d.update(now);
+  CHECK(fabsf(r.bpm) < 0.5f, "bpm is 0 for flat signal");
+}
+
+int main() {
+  test_breathing_sine();
+  test_flat_no_breath();
+  if (g_failures) {
+    printf("\n%d FAILURE(S)\n", g_failures);
+    return 1;
+  }
+  printf("\nALL C++ TESTS PASSED\n");
+  return 0;
+}

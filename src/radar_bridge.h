@@ -8,13 +8,16 @@
 namespace bridge {
 
 // Compact, low-latency stream protocol (one line per message):
-//   D<dist_mm>,<ac_mm>,<depth_mm>,<lateral_mm>,<visible>,<in_zone>,<stationary>
-//   S<bpm>,<amp>,<qual>,<visible>,<in_zone>,<stationary>
+//   D<dist>,<ac>,<depth>,<lateral>,<visible>,<in_zone>,<stationary>,<ts_ms>,<frame_id>
+//   S<bpm>,<amp>,<qual>,<visible>,<in_zone>,<stationary>,<ts_ms>,<frame_id>
 // The 'D'/'S' prefix lets the PC demultiplex without CSV ambiguity.
+// dist/ac/depth/lateral are in mm. ts_ms is millis() on the ESP, frame_id
+// monotonically increases so the PC can detect dropped frames.
 
 // Send one sample (called per radar frame -> minimal latency).
 inline void sendSample(float dist_mm, float ac_mm, float depth_mm, float lateral_mm,
-                       bool visible, bool in_zone, bool stationary) {
+                       bool visible, bool in_zone, bool stationary,
+                       uint32_t ts_ms, uint32_t frame_id) {
   Serial.print('D');
   Serial.print(dist_mm, 1);
   Serial.print(',');
@@ -28,11 +31,16 @@ inline void sendSample(float dist_mm, float ac_mm, float depth_mm, float lateral
   Serial.print(',');
   Serial.print(in_zone ? 1 : 0);
   Serial.print(',');
-  Serial.println(stationary ? 1 : 0);
+  Serial.print(stationary ? 1 : 0);
+  Serial.print(',');
+  Serial.print(ts_ms);
+  Serial.print(',');
+  Serial.println(frame_id);
 }
 
 // Send the periodic summary line.
-inline void sendSummary(const breath::Result& r, bool visible, bool in_zone, bool stationary) {
+inline void sendSummary(const breath::Result& r, bool visible, bool in_zone, bool stationary,
+                        uint32_t ts_ms, uint32_t frame_id) {
   Serial.print('S');
   Serial.print(r.bpm, 1);
   Serial.print(',');
@@ -44,15 +52,18 @@ inline void sendSummary(const breath::Result& r, bool visible, bool in_zone, boo
   Serial.print(',');
   Serial.print(in_zone ? 1 : 0);
   Serial.print(',');
-  Serial.println(stationary ? 1 : 0);
+  Serial.print(stationary ? 1 : 0);
+  Serial.print(',');
+  Serial.print(ts_ms);
+  Serial.print(',');
+  Serial.println(frame_id);
 }
 
 inline void begin(uint32_t baud) {
   Serial.begin(baud);
-  delay(1000);
   Serial.println("ESP32 LD2450 breath detector ready");
-  Serial.println("protocol: D<dist>,<ac>,<depth>,<lateral>,<visible>,<in_zone>,<stationary> per sample");
-  Serial.println("protocol: S<bpm>,<amp>,<qual>,<visible>,<in_zone>,<stationary> per summary");
+  Serial.println("protocol: D<dist>,<ac>,<depth>,<lateral>,<visible>,<in_zone>,<stationary>,<ts_ms>,<frame_id> per sample");
+  Serial.println("protocol: S<bpm>,<amp>,<qual>,<visible>,<in_zone>,<stationary>,<ts_ms>,<frame_id> per summary");
 }
 
 }  // namespace bridge
