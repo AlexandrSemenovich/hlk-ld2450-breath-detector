@@ -1,3 +1,4 @@
+#include <Arduino.h>
 #include "ld2450_parser.h"
 #include <cstring>
 
@@ -20,13 +21,13 @@ void Parser::feed(uint8_t b) {
 //          0x86B1 = 34481 -> positive -> 34481 - 32768 = 1713 mm
 int16_t Parser::decodeCoord(uint16_t raw) {
   const int16_t mag = static_cast<int16_t>(raw & 0x7FFF);
-  return (raw & 0x8000) ? mag : static_cast<int16_t>(-mag);
+  return (raw & 0x8000) ? mag : static_cast<int16_t>(-mag); // Верни как было!
 }
 
 // Speed shares the same sign encoding as coordinates (unit cm/s).
 int16_t Parser::decodeSpeed(uint16_t raw) {
   const int16_t mag = static_cast<int16_t>(raw & 0x7FFF);
-  return (raw & 0x8000) ? mag : static_cast<int16_t>(-mag);
+  return (raw & 0x8000) ? static_cast<int16_t>(-mag) : mag;
 }
 
 bool Parser::drain(Frame& out) {
@@ -54,18 +55,23 @@ bool Parser::drain(Frame& out) {
     return false;
   }
 
-  for (uint8_t i = 0; i < nTargets; i++) {
+for (uint8_t i = 0; i < nTargets; i++) {
     uint16_t o = static_cast<uint16_t>(6 + i * 8);
     Target& t = out.targets[i];
+    
     t.x           = decodeCoord(static_cast<uint16_t>(buf_[o]     | (buf_[o + 1] << 8)));
     t.y           = decodeCoord(static_cast<uint16_t>(buf_[o + 2] | (buf_[o + 3] << 8)));
     t.speed       = decodeSpeed(static_cast<uint16_t>(buf_[o + 4] | (buf_[o + 5] << 8)));
     t.distance_res = static_cast<uint16_t>(buf_[o + 6] | (buf_[o + 7] << 8));
     t.index       = i;
+
+    // Отладка
+    Serial.printf("Parsed target %d: x=%d y=%d speed=%d res=%u\n", 
+                  i, t.x, t.y, t.speed, t.distance_res);
   }
   out.count = nTargets;
   out.valid = true;
-
+  
   // Keep a copy of the raw frame for diagnostics.
   raw_len_ = (need <= RX_CAPACITY) ? need : RX_CAPACITY;
   memcpy(raw_, buf_, raw_len_);

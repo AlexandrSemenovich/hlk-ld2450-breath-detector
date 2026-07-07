@@ -13,11 +13,10 @@ import serial
 import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 import matplotlib.patches as patches
-
 import numpy as np
+import scipy.ndimage  # Для сглаживания тепловой карты
 
 def find_port():
-    """Best-effort auto-detection of a likely ESP32 port."""
     import serial.tools.list_ports
     ports = list(serial.tools.list_ports.comports())
     for p in ports:
@@ -26,7 +25,6 @@ def find_port():
             return p.device
     return ports[0].device if ports else None
 
-
 D_RE = re.compile(r"^D([-0-9.]+),([-0-9.]+),([-0-9.]+),([-0-9.]+),([01]),([01]),([01])$")
 S_RE = re.compile(r"^S([-0-9.]+),([-0-9.]+),(\d+),([01]),([01]),([01])$")
 
@@ -34,18 +32,26 @@ WINDOW_S = 20
 TREND_TAIL = 0.25
 READ_CHUNK = 500
 
-ZONE_R_MIN = 800.0
+# ==================== НАСТРОЙКИ КАРТЫ ====================
+LATERAL_MIN = -600       # Лимит влево (мм)
+LATERAL_MAX = 600        # Лимит вправо (мм)
+CENTER_LAT = 0            # Физический центр радара теперь строго 0
+DEPTH_MIN = 0
+DEPTH_MAX = 1600          # Глубина обнаружения (до 3 метров)
+# =======================================================
+
+ZONE_R_MIN = 600.0
 ZONE_R_MAX = 1200.0
 ZONE_SIDE_MAX = 150.0
-ZONE_EDGE_POINTS = 120
-
+ZONE_EDGE_POINTS = 200
 
 def build_zone_patch():
+    """Математически точное построение зоны относительно центра радара"""
     xs = np.linspace(-ZONE_SIDE_MAX, ZONE_SIDE_MAX, ZONE_EDGE_POINTS)
     inner = np.sqrt(np.maximum(0.0, ZONE_R_MIN**2 - xs**2))
     outer = np.sqrt(np.maximum(0.0, ZONE_R_MAX**2 - xs**2))
     coords = np.column_stack([
-        np.concatenate([xs, xs[::-1]]),
+        np.concatenate([xs, xs[::-1]]) + CENTER_LAT,
         np.concatenate([inner, outer[::-1]])
     ])
     return coords
@@ -54,11 +60,11 @@ def build_zone_patch():
 class Monitor:
     def __init__(self, port, baud):
         self.ser = serial.Serial(port, baud, timeout=0.02)
-        self.times = collections.deque()
-        self.dist = collections.deque()
-        self.ac = collections.deque()
-        self.depth = collections.deque()
-        self.lateral = collections.deque()
+        self.times = collections.deque(maxlen=1000)
+        self.dist = collections.deque(maxlen=1000)
+        self.ac = collections.deque(maxlen=1000)
+        self.depth = collections.deque(maxlen=1000)
+        self.lateral = collections.deque(maxlen=1000)
         self.bpm = self.amp = self.q = 0.0
         self.visible = False
         self.in_zone = False
@@ -92,8 +98,16 @@ class Monitor:
                 try:
                     dist = float(m.group(1))
                     acv = float(m.group(2))
-                    depth = float(m.group(3))
-                    lateral = float(m.group(4))
+                    depth_val = float(m.group(3))
+                    lateral_val = float(m.group(4))
+                    
+                    # Если латераль равна глубине (баг) или выходит за границы,
+                    # используем последнюю известную достоверную координату (Zero-Order Hold).
+                    # не ломает временной ряд и не телепортирует объект ложно.
+                    if abs(lateral_val - depth_val) < 1e-3 or lateral_val > LATERAL_MAX or lateral_val < LATERAL_MIN:
+                        lateral_val = self.lateral[-1] if self.lateral else CENTER_LAT
+                        depth_val = self.depth[-1] if self.depth else 0.0
+
                     self.visible = (m.group(5) == "1")
                     self.in_zone = (m.group(6) == "1")
                     self.stationary = (m.group(7) == "1")
@@ -104,15 +118,12 @@ class Monitor:
                 self.times.append(now)
                 self.dist.append(dist)
                 self.ac.append(acv)
-                self.depth.append(max(0.0, depth))
-                self.lateral.append(max(-400.0, min(400.0, lateral)))
+                self.depth.append(max(0.0, depth_val))
+                self.lateral.append(lateral_val)
 
                 while self.times and self.times[0] < now - WINDOW_S:
-                    self.times.popleft()
-                    self.dist.popleft()
-                    self.ac.popleft()
-                    self.depth.popleft()
-                    self.lateral.popleft()
+                    for dq in (self.times, self.dist, self.ac, self.depth, self.lateral):
+                        dq.popleft()
                 continue
 
             s = S_RE.match(line)
@@ -128,6 +139,11 @@ class Monitor:
                     continue
 
     def analyze_breath_fft(self):
+        if not self.in_zone:
+            self.last_valid_breath_time = None
+            self.apnea_detected = False
+            return 0.0, False, False, 0.0
+
         if not self.times or not self.ac:
             return 0.0, False, False, 0.0
 
@@ -214,58 +230,76 @@ def main():
     port = sys.argv[1] if len(sys.argv) > 1 else find_port()
     baud = int(sys.argv[2]) if len(sys.argv) > 2 else 921600
     if not port:
-        print("No serial port found. Pass it explicitly: python monitor.py COM3")
+        print("No serial port found.")
         return
 
     print(f"Connecting to {port} @ {baud} ...")
     mon = Monitor(port, baud)
-    print(f"Connected. Streaming from {port}...")
+    print("Connected.")
 
     fig, ((ax_wave, ax_breath), (ax_heat, ax_bar)) = plt.subplots(
-        2, 2, figsize=(14, 10), gridspec_kw={"height_ratios": [2, 1], "width_ratios": [1.5, 1]},
-        sharex=False)
-    fig.suptitle("HLK-LD2450 Breath Monitor (real-time)")
+        2, 2, figsize=(15, 11), gridspec_kw={"height_ratios": [2, 1], "width_ratios": [1.5, 1]}
+    )
+    fig.suptitle("HLK-LD2450 Breath Monitor — Scientific View", fontsize=14, fontweight='bold')
 
-    line_dist, = ax_wave.plot([], [], lw=0.8, color="#2c7fb8", label="distance (mm)")
-    line_trend, = ax_wave.plot([], [], lw=1.0, color="#d95f02", ls="--", label="baseline")
-    ax_wave.set_ylabel("distance (mm)")
-    ax_wave.legend(loc="upper right", fontsize=8)
-    ax_wave.grid(True, alpha=0.3)
+    # Оформление графиков сигналов
+    line_dist, = ax_wave.plot([], [], lw=1.2, color="#2c7fb8", label="Distance (mm)")
+    line_trend, = ax_wave.plot([], [], lw=1.5, color="#d95f02", ls="--", label="Baseline")
+    ax_wave.set_ylabel("Distance (mm)")
+    ax_wave.legend(loc="upper right", fontsize=10)
+    ax_wave.grid(True, alpha=0.5, linestyle='--')
 
-    line_ac, = ax_breath.plot([], [], lw=1.8, color="#2ca25f", label="breath (AC, mm)")
+    line_ac, = ax_breath.plot([], [], lw=2.0, color="#2ca25f", label="Breath Signal (AC)")
     breath_fill = None
-    ax_breath.axhline(0, color="grey", lw=0.6)
-    ax_breath.set_ylabel("breath (mm)")
-    ax_breath.set_xlabel("time (s)")
-    ax_breath.legend(loc="upper right", fontsize=8)
-    ax_breath.grid(True, alpha=0.3)
+    ax_breath.axhline(0, color="grey", lw=1.0, linestyle='--')
+    ax_breath.set_ylabel("Amplitude (mm)")
+    ax_breath.set_xlabel("Time (s)")
+    ax_breath.legend(loc="upper right", fontsize=10)
+    ax_breath.grid(True, alpha=0.5, linestyle='--')
 
-    heat_img = ax_heat.imshow(np.zeros((40, 40)), origin="lower",
-                              cmap="inferno", aspect="equal",
-                              extent=[-400.0, 400.0, 0.0, 1500.0])
-    ax_heat.set_title("Movement heatmap (lateral ←→, depth forward)")
-    ax_heat.set_xlabel("lateral mm (sideways)")
-    ax_heat.set_ylabel("depth mm (forward from sensor)")
-    ax_heat.set_xlim(-400.0, 400.0)
-    ax_heat.set_ylim(0.0, 1500.0)
-    ax_heat.grid(True, alpha=0.2)
+    # ==================== НАУЧНАЯ ТЕПЛОВАЯ КАРТА ====================
+    # Изменен aspect="auto" для растягивания по ширине окна
+    heat_img = ax_heat.imshow(
+        np.zeros((100, 100)), origin="lower", cmap="inferno", aspect="auto",
+        extent=[LATERAL_MIN, LATERAL_MAX, DEPTH_MIN, DEPTH_MAX], interpolation='nearest'
+    )
+    
+    # Добавление цветовой шкалы (colorbar) для строгой оценки
+    cbar = fig.colorbar(heat_img, ax=ax_heat, fraction=0.046, pad=0.04)
+    cbar.set_label('Position Density', rotation=270, labelpad=15)
 
-    zone_patch = patches.Polygon(build_zone_patch(), closed=True,
-                                facecolor='none', edgecolor='cyan', lw=1.4,
-                                linestyle='--', alpha=0.8)
+    ax_heat.set_title("Target Spatial Distribution", fontsize=12)
+    ax_heat.set_xlabel("Lateral Axis (mm)")
+    ax_heat.set_ylabel("Depth Axis (mm)")
+    ax_heat.set_xlim(LATERAL_MIN, LATERAL_MAX)
+    ax_heat.set_ylim(DEPTH_MIN, DEPTH_MAX)
+    ax_heat.grid(True, alpha=0.4, linestyle=':', color='white')
+
+    ax_heat.axvline(CENTER_LAT, color='white', lw=1.5, alpha=0.6, linestyle='-.')
+    ax_heat.plot(CENTER_LAT, 0, marker='^', color='white', markersize=10, clip_on=False)
+    ax_heat.text(CENTER_LAT, 40, 'RADAR TX/RX', ha='center', color='white', fontsize=10, fontweight='bold')
+
+    zone_patch = patches.Polygon(
+        build_zone_patch(), closed=True,
+        facecolor='none', edgecolor='#00ffff', lw=2.5,
+        linestyle='--', alpha=0.9, label='Detection Zone'
+    )
     ax_heat.add_patch(zone_patch)
+    ax_heat.legend(loc="upper left", facecolor='black', labelcolor='white')
 
-    heat_marker, = ax_heat.plot([], [], marker='o', markersize=14,
-                                markerfacecolor='cyan', markeredgecolor='white',
-                                markeredgewidth=2, linestyle='')
+    heat_marker, = ax_heat.plot([], [], marker='o', markersize=16,
+                                markerfacecolor='#00ff00', markeredgecolor='white', markeredgewidth=2)
 
-    bar = ax_bar.barh(["bpm"], [0], color="#41ab5d")
+    # Гистограмма ЧДД
+    bar = ax_bar.barh(["BPM (FFT)"], [0], color="#41ab5d")
     ax_bar.set_xlim(0, 40)
-    ax_bar.set_xlabel("breaths / min")
-    ax_bar.grid(True, axis="x", alpha=0.3)
+    ax_bar.set_xlabel("Breaths / Min")
+    ax_bar.grid(True, axis="x", alpha=0.5, linestyle='--')
 
-    txt_stat = fig.text(0.01, 0.97, "", fontsize=9.5,
-                        bbox=dict(boxstyle="round", fc="white", alpha=0.85))
+    txt_stat = fig.text(0.02, 0.96, "", fontsize=11, family='monospace',
+                        bbox=dict(boxstyle="round,pad=0.5", fc="#f8f9fa", ec="#dee2e6", alpha=0.95))
+    
+    plt.tight_layout(rect=[0, 0, 1, 0.95]) # Оптимизация отступов
 
     def update(_):
         nonlocal breath_fill
@@ -273,106 +307,89 @@ def main():
             breath_fill.remove()
             breath_fill = None
 
-        try:
-            mon.poll()
-            py_bpm, detected, apnea, quality = mon.analyze_breath_fft()
-        except (serial.SerialException, OSError):
-            plt.close(fig)
-            return line_dist, line_trend, line_ac, bar
+        mon.poll()
+        py_bpm, detected, apnea, quality = mon.analyze_breath_fft()
 
-        try:
-            if not mon.times:
-                line_dist.set_data([], [])
-                line_trend.set_data([], [])
-                line_ac.set_data([], [])
-                txt_stat.set_text("No data yet")
-                bar[0].set_width(0)
-                return line_dist, line_trend, line_ac, bar
+        if not mon.times:
+            return line_dist, line_trend, line_ac, bar, heat_img, heat_marker
 
-            t = list(mon.times)
-            d = list(mon.dist)
-            a = list(mon.ac)
-            depth = list(mon.depth)
-            lateral = list(mon.lateral)
-            tr = mon.baseline()
+        t = list(mon.times)
+        d = list(mon.dist)
+        a = list(mon.ac)
+        depth = list(mon.depth)
+        lateral = list(mon.lateral)
+        tr = mon.baseline()
 
-            line_dist.set_data(t, d)
-            line_trend.set_data(t, tr)
-            line_ac.set_data(t, a)
+        # Обновление графиков
+        line_dist.set_data(t, d)
+        line_trend.set_data(t, tr)
+        line_ac.set_data(t, a)
 
-            # === Wave plots limits ===
-            ax_wave.set_xlim(max(0, t[0]), max(t[-1], 1))
-            if d and tr:
-                lo = min(min(d), min(tr)) - 5
-                hi = max(max(d), max(tr)) + 5
-                ax_wave.set_ylim(lo, hi)
+        ax_wave.set_xlim(max(0, t[0]), max(t[-1], 1))
+        if d and tr:
+            y_min = min(min(d), min(tr)) - 10
+            y_max = max(max(d), max(tr)) + 10
+            if y_max > y_min:
+                ax_wave.set_ylim(y_min, y_max)
 
-            if a:
-                amax = max(2.0, max(abs(v) for v in a) * 1.2)
-                ax_breath.set_ylim(-amax, amax)
-            ax_breath.set_xlim(max(0, t[0]), max(t[-1], 1))
+        if a:
+            amax = max(2.0, max(abs(v) for v in a) * 1.3)
+            ax_breath.set_ylim(-amax, amax)
+        ax_breath.set_xlim(max(0, t[0]), max(t[-1], 1))
 
-            line_ac.set_color("#2ca25f" if detected else "#888888")
-            ax_breath.set_title("breath (AC, mm) " + ("[BREATHING]" if detected else "[idle]"))
+        line_ac.set_color("#2ca25f" if detected else "#adb5bd")
+        
+        if a and t:
+            breath_fill = ax_breath.fill_between(t, a, 0, color="#2ca25f" if detected else "#adb5bd", alpha=0.15)
 
-            if a and t:
-                breath_fill = ax_breath.fill_between(t, a, 0, color="#2ca25f", alpha=0.12)
+        # Вычисление сглаженной тепловой карты
+        if depth and lateral:
+            depth_arr = np.clip(depth, DEPTH_MIN, DEPTH_MAX)
+            lateral_arr = np.clip(lateral, LATERAL_MIN, LATERAL_MAX)
 
-            # === Heatmap + Marker ===
-            if depth and lateral:
-                depth_arr = np.clip(depth, 0.0, 1500.0)
-                lateral_arr = np.clip(lateral, -400.0, 400.0)
-
-                heat, _, _ = np.histogram2d(
-                    lateral_arr, depth_arr, bins=40,
-                    range=[[-400.0, 400.0], [0.0, 1500.0]])
-
-                heat_img.set_data(heat.T)
-                heat_img.set_clim(0, max(1.0, np.max(heat)))
-
-                last_lat = lateral_arr[-1]
-                last_dep = depth_arr[-1]
-
-                heat_marker.set_data([last_lat], [last_dep])
-                heat_marker.set_markerfacecolor('cyan' if mon.in_zone else 'yellow')
-
-                pos_text = f"Depth={last_dep:.0f} mm, Lat={last_lat:.0f} mm"
-                if last_dep < 50:
-                    pos_text += " [BOTTOM EDGE - side detection]"
-            else:
-                heat_img.set_data(np.zeros((40, 40)))
-                heat_marker.set_data([], [])
-                pos_text = "Pos: no data"
-
-            # Status text
-            radar_state = "YES" if mon.visible else "NO"
-            zone_state = "YES" if mon.in_zone else "NO"
-            stationary_state = "YES" if mon.stationary else "NO"
-            tracking_state = "TRACKING" if mon.in_zone and mon.visible else (
-                "VISIBLE" if mon.visible else "NO TARGET")
-
-            txt_stat.set_text(
-                f"State: {tracking_state} | Stationary: {stationary_state}\n"
-                f"FW BPM: {mon.bpm:5.1f} | PY FFT BPM: {py_bpm:5.1f}\n"
-                f"{pos_text} | Breathing: {'YES' if detected else 'NO'} | "
-                f"Quality: {quality:5.1f}% | Apnea: {'YES' if apnea else 'NO'}"
+            # Создаем 2D гистограмму (матрица 100x100)
+            heat_raw, _, _ = np.histogram2d(
+                lateral_arr, depth_arr, bins=100,
+                range=[[LATERAL_MIN, LATERAL_MAX], [DEPTH_MIN, DEPTH_MAX]]
             )
+            
+            # Применяем Гауссово размытие для визуальной эстетики (настоящий Heatmap)
+            heat_smooth = scipy.ndimage.gaussian_filter(heat_raw, sigma=1.8)
 
-            bar[0].set_width(mon.bpm if mon.bpm > 0 else 0)
+            heat_img.set_data(heat_smooth.T)
+            vmax = max(0.1, np.max(heat_smooth))
+            heat_img.set_clim(0, vmax)
 
-        except Exception as e:
-            txt_stat.set_text(f"Monitor error\n{e}")
-            print("update error:", e, file=sys.stderr)
+            last_lat = lateral_arr[-1]
+            last_dep = depth_arr[-1]
+            heat_marker.set_data([last_lat], [last_dep])
+            heat_marker.set_markerfacecolor('#00ff00' if mon.in_zone else '#ffae00')
+        else:
+            heat_img.set_data(np.zeros((100, 100)))
+            heat_marker.set_data([], [])
 
-        return line_dist, line_trend, line_ac, bar
+        # Информационная панель
+        tracking_state = "TRACKING" if mon.in_zone and mon.visible else ("VISIBLE" if mon.visible else "NO TARGET")
+        bg_color = "#ffe3e3" if apnea else "#f8f9fa"
+        txt_stat.set_bbox(dict(boxstyle="round,pad=0.5", fc=bg_color, ec="#dee2e6", alpha=0.95))
+        
+        txt_stat.set_text(
+            f"SYSTEM STATE : {tracking_state:<10} | STATIONARY: {'YES' if mon.stationary else 'NO':<3} | APNEA: {'DETECTED ⚠️' if apnea else 'OK'}\n"
+            f"ALGORITHM    : FW BPM = {mon.bpm:>4.1f} | PY BPM (FFT) = {py_bpm:>4.1f} \n"
+            f"SIGNAL METRIC: BREATHING = {'YES' if detected else 'NO':<3} | QUALITY = {quality:>5.1f}%"
+        )
 
-    ani = animation.FuncAnimation(fig, update, interval=30,
-                                  blit=False, cache_frame_data=False)
+        bar[0].set_width(py_bpm if detected else 0)
+
+        return line_dist, line_trend, line_ac, bar, heat_img, heat_marker
+
+    ani = animation.FuncAnimation(fig, update, interval=33, blit=False, cache_frame_data=False)
     plt.show()
-
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
         pass
+    finally:
+        plt.close()
