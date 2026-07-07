@@ -42,6 +42,8 @@ class Detector {
   const Config& cfg() const { return cfg_; }
   float debugLp() const { return lp_; }
   bool debugPrimed() const { return primed_; }
+  float ac() const { return ac_; }          // detrended breath signal (mm)
+  uint16_t fill() const { return hist_fill_; }
 
   // Feed one raw radial distance (mm) measured at `now_ms`.
   // Performs all filtering/detection for this sample.
@@ -49,10 +51,6 @@ class Detector {
 
   // Return the latest computed result (no heavy work).
   const Result& update(uint32_t /*now_ms*/) const { return result_; }
-
-  // Copy up to `n` most-recent AC samples (oldest first) into `out`.
-  // Returns the number of samples actually copied.
-  uint16_t getWave(float* out, uint16_t n) const;
 
   void reset();
 

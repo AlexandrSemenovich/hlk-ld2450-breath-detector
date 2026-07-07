@@ -73,18 +73,6 @@ void Detector::push(float distance_mm, uint32_t now_ms) {
   result_.distance = lp_;
 }
 
-uint16_t Detector::getWave(float* out, uint16_t n) const {
-  const uint16_t hsize = historySize();
-  const uint16_t avail = (hist_fill_ < hsize) ? hist_fill_ : hsize;
-  if (n > avail) n = avail;
-  // Oldest sample sits at hist_idx_ (ring start); copy n most-recent.
-  const uint16_t start = (hist_idx_ + hsize - n) % hsize;
-  for (uint16_t i = 0; i < n; i++) {
-    out[i] = hist_[(start + i) % hsize];
-  }
-  return n;
-}
-
 void Detector::reset() {
   lp_ = trend_ = ac_ = 0.0f;
   primed_ = false;

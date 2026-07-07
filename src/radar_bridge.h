@@ -7,46 +7,52 @@
 
 namespace bridge {
 
-// Prints one CSV line: <bpm>,<amp_mm>,<quality>,<dist_mm>
-inline void sendResult(const breath::Result& r) {
+// Compact, low-latency stream protocol (one line per message):
+//   D<dist_mm>,<ac_mm>,<depth_mm>,<lateral_mm>,<visible>,<in_zone>,<stationary>
+//   S<bpm>,<amp>,<qual>,<visible>,<in_zone>,<stationary>
+// The 'D'/'S' prefix lets the PC demultiplex without CSV ambiguity.
+
+// Send one sample (called per radar frame -> minimal latency).
+inline void sendSample(float dist_mm, float ac_mm, float depth_mm, float lateral_mm,
+                       bool visible, bool in_zone, bool stationary) {
+  Serial.print('D');
+  Serial.print(dist_mm, 1);
+  Serial.print(',');
+  Serial.print(ac_mm, 2);
+  Serial.print(',');
+  Serial.print(depth_mm, 1);
+  Serial.print(',');
+  Serial.print(lateral_mm, 1);
+  Serial.print(',');
+  Serial.print(visible ? 1 : 0);
+  Serial.print(',');
+  Serial.print(in_zone ? 1 : 0);
+  Serial.print(',');
+  Serial.println(stationary ? 1 : 0);
+}
+
+// Send the periodic summary line.
+inline void sendSummary(const breath::Result& r, bool visible, bool in_zone, bool stationary) {
+  Serial.print('S');
   Serial.print(r.bpm, 1);
   Serial.print(',');
   Serial.print(r.amplitude, 1);
   Serial.print(',');
   Serial.print(static_cast<int>(r.quality));
   Serial.print(',');
-  Serial.println(r.distance, 1);
+  Serial.print(visible ? 1 : 0);
+  Serial.print(',');
+  Serial.print(in_zone ? 1 : 0);
+  Serial.print(',');
+  Serial.println(stationary ? 1 : 0);
 }
 
 inline void begin(uint32_t baud) {
   Serial.begin(baud);
   delay(1000);
   Serial.println("ESP32 LD2450 breath detector ready");
-  Serial.println("bpm,amp_mm,quality,dist_mm");
-}
-
-// Draws a scrolling ASCII waveform of the breath signal (AC, mm).
-// `wave` holds the most-recent samples (oldest first). Zero is printed as
-// a center line '|'; samples are mapped to height `half` characters.
-inline void sendWave(const float* wave, uint16_t n, float scale_mm = 8.0f, uint8_t half = 12) {
-  if (n == 0) return;
-  for (uint16_t i = 0; i < n; ++i) {
-    float v = wave[i] / scale_mm;        // normalize to ~[-1,1]
-    if (v > 1.0f) v = 1.0f;
-    if (v < -1.0f) v = -1.0f;
-    int16_t row = static_cast<int16_t>(v * half);   // signed offset from center
-    for (int16_t r = -half; r <= half; ++r) {
-      if (r == 0) {
-        Serial.print('|');                 // zero baseline
-      } else if (r == row) {
-        Serial.print(row >= 0 ? '^' : 'v'); // sample marker (up/down)
-      } else {
-        Serial.print(' ');
-      }
-    }
-    Serial.println();
-  }
-  Serial.println("---- breath waveform (^ inhale / v exhale) ----");
+  Serial.println("protocol: D<dist>,<ac>,<depth>,<lateral>,<visible>,<in_zone>,<stationary> per sample");
+  Serial.println("protocol: S<bpm>,<amp>,<qual>,<visible>,<in_zone>,<stationary> per summary");
 }
 
 }  // namespace bridge
