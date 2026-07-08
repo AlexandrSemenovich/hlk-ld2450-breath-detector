@@ -20,6 +20,10 @@ static ld2450::Parser parser;
 static uint32_t       last_frame_ms = 0;
 static uint32_t       frame_counter = 0;
 
+unsigned long startTime = 0; 
+unsigned long duration = 60000;
+bool isRunning  = true, start = true;
+
 // Transparent forwarder: parse radar frames and relay raw targets to the PC.
 // All target selection and breath detection is done on the PC side.
 static void pollRadar(uint32_t now) {
@@ -45,5 +49,18 @@ void setup() {
 }
 
 void loop() {
-  pollRadar(millis());
+  if (start){
+    Serial.println("Start");
+    start = false;
+  }
+  
+  if (isRunning) {
+    if (millis() - startTime < duration) {
+      pollRadar(millis());  
+    } else {
+      isRunning = false;        // Время вышло, выключаем таймер
+      Serial.println("Stop");
+    }
+  }
+
 }
