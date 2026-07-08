@@ -47,15 +47,9 @@ class Parser {
   // Number of buffered bytes not yet consumed.
   uint16_t size() const { return len_; }
 
-  // Copy the raw bytes of the most recently extracted valid frame.
-  uint16_t lastRaw(uint8_t* out, uint16_t maxlen) const;
-
  private:
   uint8_t  buf_[RX_CAPACITY];
   uint16_t len_ = 0;
-
-  uint8_t  raw_[RX_CAPACITY];   // last extracted valid frame
-  uint16_t raw_len_ = 0;
 
   static int16_t decodeCoord(uint16_t raw);
   static int16_t decodeSpeed(uint16_t raw);

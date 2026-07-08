@@ -67,20 +67,10 @@ bool Parser::drain(Frame& out) {
   }
   out.count = nTargets;
   out.valid = true;
-  
-  // Keep a copy of the raw frame for diagnostics.
-  raw_len_ = (need <= RX_CAPACITY) ? need : RX_CAPACITY;
-  memcpy(raw_, buf_, raw_len_);
 
   memmove(buf_, buf_ + need, len_ - need);
   len_ -= need;
   return true;
-}
-
-uint16_t Parser::lastRaw(uint8_t* out, uint16_t maxlen) const {
-  const uint16_t n = (raw_len_ < maxlen) ? raw_len_ : maxlen;
-  if (n && out) memcpy(out, raw_, n);
-  return raw_len_;
 }
 
 }  // namespace ld2450

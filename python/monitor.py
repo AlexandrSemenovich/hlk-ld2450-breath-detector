@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Live breath monitor for the HLK-LD2450 ESP32 firmware.
 
-PC-centric analysis: the ESP32 only forwards raw radar target data (plus a
-lightweight firmware BPM estimate for reference). All heavy lifting — band-pass
-filtering, FFT, SNR/quality and apnea detection — happens here in Python.
+PC-centric analysis: the ESP32 is now a transparent forwarder of raw radar
+target frames (3 targets per UART frame). All target selection, band-pass
+filtering, FFT, SNR/quality and apnea detection happen here in Python.
 """
 
 import sys
 import os
 import re
 import time
+import math
 import threading
 import collections
 
@@ -45,8 +46,12 @@ def find_port():
     return ports[0].device if ports else None
 
 
-D_RE = re.compile(r"^D([-0-9.]+),([-0-9.]+),([-0-9.]+),([-0-9.]+),([01]),([01]),([01]),(\d+),(\d+)$")
-S_RE = re.compile(r"^S([-0-9.]+),([-0-9.]+),(\d+),([01]),([01]),([01]),(\d+),(\d+)$")
+# Новый протокол: одна строка R на кадр радара, 3 цели по 4 поля
+# (x, y, speed, distance_res) + ts_ms + frame_id = 14 полей.
+# x, y   : signed mm (lateral x, longitudinal y)
+# speed  : signed cm/s
+# res    : uint16, разрешение дистанции (0 => слот пустой)
+R_RE = re.compile(r"^R" + ",".join([r"([-0-9]+)"] * 12) + r",(\d+),(\d+)$")
 
 WINDOW_S = 30
 TREND_TAIL = 0.25
@@ -60,9 +65,14 @@ DEPTH_MIN = 0
 DEPTH_MAX = 2600         # Глубина обнаружения (до ~2.5 м)
 # =======================================================
 
+# Константы выбора цели (зеркалят бывший ESP32 firmware).
+VALID_R_MIN = 100.0
+VALID_R_MAX = 6000.0
 ZONE_R_MIN = 600.0
 ZONE_R_MAX = 2500.0
 ZONE_SIDE_MAX = 500.0
+STATIONARY_SPEED_THRESHOLD = 80.0   # cm/s
+
 ZONE_EDGE_POINTS = 200
 
 # Breath band (Hz) -> 7.2 .. 30 breaths/min, with margin.
@@ -72,6 +82,90 @@ MIN_BPM = 5.0
 MAX_BPM = 40.0
 APNEA_S = 15.0
 SNR_THRESHOLD = 3.0
+
+
+def radial_of(x, y):
+    return math.hypot(x, y)
+
+
+def pick_target(targets, locked_index):
+    """Выбор цели целиком на ПК.
+
+    Приоритет:
+      1) удерживать ранее выбранную цель, если она ещё в зоне и стационарна
+      2) ближайшая стационарная цель в зоне
+      3) fallback: ближайшая присутствующая цель (для прицеливания)
+    targets: список (x, y, speed, res); res == 0 => слот пустой.
+    Возвращает индекс цели или None.
+    """
+    present = [(i, radial_of(t[0], t[1])) for i, t in enumerate(targets) if t[3] != 0]
+    if not present:
+        return None
+
+    if locked_index is not None:
+        for i, r in present:
+            if i != locked_index:
+                continue
+            t = targets[i]
+            if (ZONE_R_MIN <= r <= ZONE_R_MAX and abs(t[0]) <= ZONE_SIDE_MAX
+                    and abs(t[2]) < STATIONARY_SPEED_THRESHOLD):
+                return i
+
+    best = None
+    best_r = 1e12
+    for i, r in present:
+        t = targets[i]
+        if not (ZONE_R_MIN <= r <= ZONE_R_MAX and abs(t[0]) <= ZONE_SIDE_MAX):
+            continue
+        if abs(t[2]) >= STATIONARY_SPEED_THRESHOLD:
+            continue
+        if r < best_r:
+            best_r = r
+            best = i
+    if best is not None:
+        return best
+
+    # Fallback: ближайшая присутствующая цель (прицеливание/отладка).
+    best = None
+    best_r = 1e12
+    for i, r in present:
+        if r < best_r:
+            best_r = r
+            best = i
+    return best
+
+
+class Detrender:
+    """Детренд сигнала дистанции (зеркалит бывший firmware breath_detector).
+
+    lp = EMA низких частот; ac = lp - trend, trend = медленный high-pass.
+    """
+
+    def __init__(self, lp_alpha=0.15, trend_tau_ms=6000.0):
+        self.lp_alpha = lp_alpha
+        self.trend_tau = trend_tau_ms
+        self.lp = None
+        self.trend = None
+        self.last_ms = None
+
+    def push(self, dist_mm, now_ms):
+        if self.lp is None:
+            self.lp = self.trend = dist_mm
+            self.last_ms = now_ms
+            return 0.0
+        dms = now_ms - self.last_ms
+        if dms > 500:
+            dms = 500
+        self.last_ms = now_ms
+        dt = dms
+        self.lp = self.lp_alpha * dist_mm + (1.0 - self.lp_alpha) * self.lp
+        a = 1.0 - math.exp(-dt / self.trend_tau)
+        self.trend += a * (self.lp - self.trend)
+        return self.lp - self.trend
+
+    def reset(self):
+        self.lp = self.trend = None
+        self.last_ms = None
 
 
 def build_zone_patch():
@@ -176,6 +270,8 @@ class Monitor:
         self._stop = False
         self.last_frame_id = 0
         self.dropped = 0
+        self.locked_index = None
+        self.detrender = Detrender()
         self._sync()
         self.thread = threading.Thread(target=self.reader, daemon=True)
         self.thread.start()
@@ -199,61 +295,72 @@ class Monitor:
             self._handle(line)
 
     def _handle(self, line):
-        m = D_RE.match(line)
-        if m:
-            try:
-                dist = float(m.group(1))
-                acv = float(m.group(2))
-                depth_val = float(m.group(3))
-                lateral_val = float(m.group(4))
-                ts_ms = int(m.group(8))
-                frame_id = int(m.group(9))
-
-                # Zero-Order-Hold защита от выбросов/багов координат.
-                if lateral_val > LATERAL_MAX or lateral_val < LATERAL_MIN or depth_val < DEPTH_MIN:
-                    lateral_val = self.lateral[-1] if self.lateral else CENTER_LAT
-                    depth_val = self.depth[-1] if self.depth else 0.0
-
-                visible = (m.group(5) == "1")
-                in_zone = (m.group(6) == "1")
-                stationary = (m.group(7) == "1")
-            except ValueError:
-                return
-
-            with self.lock:
-                now = time.time() - self.start
-                # Детект пропущенных кадров.
-                if self.last_frame_id and frame_id != self.last_frame_id + 1:
-                    self.dropped += (frame_id - self.last_frame_id - 1)
-                self.last_frame_id = frame_id
-
-                self.times.append(now)
-                self.dist.append(dist)
-                self.ac.append(acv)
-                self.depth.append(max(0.0, depth_val))
-                self.lateral.append(lateral_val)
-                self.tsms.append(ts_ms)
-                self.visible = visible
-                self.in_zone = in_zone
-                self.stationary = stationary
-
-                while self.times and self.times[0] < now - WINDOW_S:
-                    for dq in (self.times, self.dist, self.ac, self.depth, self.lateral, self.tsms):
-                        dq.popleft()
+        m = R_RE.match(line)
+        if not m:
+            return
+        try:
+            vals = [int(m.group(k)) for k in range(1, 13)]
+            ts_ms = int(m.group(13))
+            frame_id = int(m.group(14))
+        except ValueError:
             return
 
-        s = S_RE.match(line)
-        if s:
-            try:
-                with self.lock:
-                    self.bpm = float(s.group(1))
-                    self.amp = float(s.group(2))
-                    self.q = float(s.group(3))
-                    self.visible = (s.group(4) == "1")
-                    self.in_zone = (s.group(5) == "1")
-                    self.stationary = (s.group(6) == "1")
-            except ValueError:
+        targets = [
+            (vals[0], vals[1], vals[2], vals[3]),
+            (vals[4], vals[5], vals[6], vals[7]),
+            (vals[8], vals[9], vals[10], vals[11]),
+        ]
+
+        with self.lock:
+            sel = pick_target(targets, self.locked_index)
+            self.locked_index = sel if sel is not None else None
+
+            # Детект пропущенных кадров.
+            if self.last_frame_id and frame_id != self.last_frame_id + 1:
+                self.dropped += (frame_id - self.last_frame_id - 1)
+            self.last_frame_id = frame_id
+
+            now = time.time() - self.start
+            self.times.append(now)
+
+            if sel is None:
+                self.detrender.reset()
+                self.visible = False
+                self.in_zone = False
+                self.stationary = False
+                self.dist.append(0.0)
+                self.ac.append(0.0)
+                self.depth.append(0.0)
+                self.lateral.append(self.lateral[-1] if self.lateral else CENTER_LAT)
+                self.tsms.append(ts_ms)
                 return
+
+            x, y, speed, _res = targets[sel]
+            depth = radial_of(x, y)        # ось дыхания (mm)
+            lateral = float(x)             # поперечная ось (mm)
+            stationary = abs(speed) < STATIONARY_SPEED_THRESHOLD
+            in_zone = (ZONE_R_MIN <= depth <= ZONE_R_MAX and abs(x) <= ZONE_SIDE_MAX)
+
+            # Zero-Order-Hold защита от выбросов/багов координат.
+            if depth < DEPTH_MIN or lateral < LATERAL_MIN or lateral > LATERAL_MAX:
+                depth = self.depth[-1] if self.depth else 0.0
+                lateral = self.lateral[-1] if self.lateral else CENTER_LAT
+
+            # Детектор питается только стационарной целью в зоне.
+            if in_zone and stationary:
+                ac = self.detrender.push(depth, ts_ms)
+            else:
+                self.detrender.reset()
+                ac = 0.0
+
+            self.visible = True
+            self.in_zone = in_zone
+            self.stationary = stationary
+            self.dist.append(depth)
+            self.ac.append(ac)
+            self.depth.append(max(0.0, depth))
+            self.lateral.append(lateral)
+            self.tsms.append(ts_ms)
 
     def poll(self):
         """Deprecated: data is now collected by the reader thread."""
@@ -279,6 +386,8 @@ class Monitor:
         else:
             self.apnea_detected = (current_time - self.last_valid_breath_time) > APNEA_S
 
+        self.bpm = bpm
+        self.q = quality
         return bpm, detected, self.apnea_detected, quality
 
     def baseline(self):
@@ -379,7 +488,6 @@ def main():
             in_zone = mon.in_zone
             visible = mon.visible
             stationary = mon.stationary
-            fw_bpm = mon.bpm
             dropped = mon.dropped
 
         tr = mon.baseline()
@@ -427,7 +535,7 @@ def main():
 
         txt_stat.set_text(
             f"SYSTEM STATE : {tracking_state:<10} | STATIONARY: {'YES' if stationary else 'NO':<3} | APNEA: {'DETECTED' if apnea else 'OK'}\n"
-            f"ALGORITHM    : FW BPM = {fw_bpm:>4.1f} | PY BPM (FFT) = {py_bpm:>4.1f} \n"
+            f"ALGORITHM    : PY BPM (FFT) = {py_bpm:>4.1f}\n"
             f"SIGNAL METRIC: BREATHING = {'YES' if detected else 'NO':<3} | QUALITY = {quality:>5.1f}% | DROPPED = {dropped}"
         )
 

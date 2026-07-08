@@ -21,7 +21,12 @@
 
 ## Этап 2 — Протокол и архитектура (PC-centric)
 - [x] 6. radar_bridge.h: добавить frame_id и ts_ms в D/S строки; обновить описание протокола
-- [x] 7. main.cpp: слать сырые x,y,speed,res + radial + ts + frame_id; держать fw-BPM как вторичную оценку (FW vs PY)
+- [x] 7. main.cpp: ESP32 стал прозрачным форвардером — шлёт сырые цели
+         R<x0>,<y0>,<spd0>,<res0>,<x1>,<y1>,<spd1>,<res1>,<x2>,<y2>,<spd2>,<res2>,
+         <ts_ms>,<frame_id>; выбор цели и вся детекция дыхания перенесены на ПК
+         (monitor.py: pick_target + Detrender + detect_breath). Удалены
+         src/breath_detector.{cpp,h}, cpp_test/ (осиротевший C++-тест),
+         native-env из platformio.ini.
 - [x] 8. monitor.py: обновить regex под новый D/S; fs/окно FFT считать по ts радара (robust)
 
 ## Этап 3 — Улучшение PC-анализа
@@ -40,7 +45,7 @@
           нативно через `src_dir = cpp_test` в `[env:native]`. Запуск:
           `pio run -e native` затем `.pio\build\native\program.exe`
           (вариант: `g++ -std=c++17 -I src cpp_test/test_main.cpp src/breath_detector.cpp -o t && t`).
-        - Python: `test/test_pc_fft.py` (чистая ф-ция `detect_breath`) — `pytest test/`.
+        - Python: `python/tests/test_pc_fft.py` (чистая ф-ция `detect_breath`) — `pytest python/tests/`.
         (в этом окружении pio/зависимости не установлены, поэтому не исполнялись)
 - [x] 18. неиспользуемые константы убраны при переписывании main.cpp (MOTION_SPEED_CMS, dbg-*, computeDistAndDepth);
         STATIONARY_SPEED_THRESHOLD/VALID_R*/ZONE_* используются
@@ -73,4 +78,23 @@
         monitor.py менять не нужно — он парсит только строки D/S от ESP и берёт depth/lateral
         напрямую; после правки ESP шлёт корректно подписанные координаты.
         (опц.) можно синхронизировать ZONE_R_MAX в monitor.py (1200) с ESP (2500) для совпадения
-        отрисовки зоны на тепловой карте — косметика, не влияет на детекцию.
+         отрисовки зоны на тепловой карте — косметика, не влияет на детекцию.
+
+## Этап 8 — Полный перенос детекции на ПК (прозрачный форвардер)
+- [x] 22. ESP32 стал прозрачным форвардером сырых целей (см. п.7). Протокол
+         теперь одна строка R на кадр со всеми 3 целями:
+         `R<x0>,<y0>,<spd0>,<res0>,<x1>,<y1>,<spd1>,<res1>,<x2>,<y2>,<spd2>,<res2>,<ts_ms>,<frame_id>`.
+- [x] 23. Удалён `src/breath_detector.{cpp,h}` — алгоритм дыхания теперь целиком
+         в Python (`python/monitor.py` + `python/tests/test_pc_fft.py`). `radar_bridge.h` больше
+         не зависит от `breath_detector.h`.
+- [x] 24. Удалён осиротевший C++-тест `cpp_test/test_main.{cpp,txt}` и `[env:native]`
+         из platformio.ini (сборка падала бы без main).
+- [x] 25. python/monitor.py: PC выбирает стационарную цель в зоне (`pick_target`,
+         radial=√(x²+y²)), детрендит дистанцию (`Detrender`, зеркало fw), кормит
+         `detect_breath` (band-pass+FFT+BPM+quality+апноэ). Тепловая карта по
+         x/radial. С монитора убрано сравнение FW BPM vs PY BPM — остался только
+         PY BPM (FW-BPM был избыточен).
+- [x] 27. Весь Python-код перенесён в папку `python/` (monitor.py, requirements.txt,
+         tests/test_pc_fft.py, conftest.py для importable). Корень репозитория
+         теперь содержит только firmware (src/, platformio.ini) и документацию.
+- [x] 26. README.md: протокол/архитектура/тесты обновлены под форвардер.
