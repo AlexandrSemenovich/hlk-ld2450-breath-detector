@@ -1,6 +1,12 @@
 #include "ld2450_parser.h"
 #include <cstring>
 
+
+// хранит "состояние" целей между кадрами.
+static int16_t last_x[ld2450::MAX_TARGETS] = {0};
+static int16_t last_y[ld2450::MAX_TARGETS] = {0};
+static bool    is_active[ld2450::MAX_TARGETS] = {false};
+
 namespace ld2450 {
 
 void Parser::feed(uint8_t b) {
@@ -56,14 +62,37 @@ bool Parser::drain(Frame& out) {
   }
 
   for (uint8_t i = 0; i < nTargets; i++) {
-    const uint16_t o = static_cast<uint16_t>(4 + i * 8);        // first target at offset 4
+    // ВОТ ЭТА СТРОКА БЫЛА ПОТЕРЯНА:
+    const uint16_t o = static_cast<uint16_t>(4 + i * 8); 
+    
     Target& t = out.targets[i];
-
-    t.x           = decodeCoord(static_cast<uint16_t>(buf_[o]     | (buf_[o + 1] << 8)));
-    t.y           = decodeCoord(static_cast<uint16_t>(buf_[o + 2] | (buf_[o + 3] << 8)));
-    t.speed       = decodeSpeed(static_cast<uint16_t>(buf_[o + 4] | (buf_[o + 5] << 8)));
     t.distance_res = static_cast<uint16_t>(buf_[o + 6] | (buf_[o + 7] << 8));
-    t.index       = i;
+    int16_t raw_x = decodeCoord(static_cast<uint16_t>(buf_[o]     | (buf_[o + 1] << 8)));
+    int16_t raw_y = decodeCoord(static_cast<uint16_t>(buf_[o + 2] | (buf_[o + 3] << 8)));
+
+    // Проверка границ (убедись, что ZONE_MAX_Y и другие определены в .h файле)
+    bool is_out = (raw_y > ZONE_MAX_Y) || (raw_y < ZONE_MIN_Y) || 
+                  (raw_x > ZONE_MAX_X) || (raw_x < ZONE_MIN_X);
+
+    if (t.distance_res != 0 && !is_out) {
+      if (is_active[i]) {
+        t.x = (int16_t)(raw_x * 0.2 + last_x[i] * 0.8);
+        t.y = (int16_t)(raw_y * 0.2 + last_y[i] * 0.8);
+      } else {
+        t.x = raw_x;
+        t.y = raw_y;
+        is_active[i] = true;
+      }
+      last_x[i] = t.x;
+      last_y[i] = t.y;
+      t.speed = decodeSpeed(static_cast<uint16_t>(buf_[o + 4] | (buf_[o + 5] << 8)));
+    } else {
+      t.x = 0;
+      t.y = 0;
+      t.speed = 0;
+      t.distance_res = 0;
+      is_active[i] = false;
+    }
   }
   out.count = nTargets;
   out.valid = true;
