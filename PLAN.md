@@ -98,3 +98,28 @@
          tests/test_pc_fft.py, conftest.py для importable). Корень репозитория
          теперь содержит только firmware (src/, platformio.ini) и документацию.
 - [x] 26. README.md: протокол/архитектура/тесты обновлены под форвардер.
+
+## Этап 9 — Модульная перестройка python/ (расширяемость)
+- [x] 28. `protocol.py` — ЕДИНСТВЕННОЕ место, знающее формат R-строки; `decode_line`
+         возвращает `RawFrame` (dataclass Target x3 + ts_ms + frame_id). Парсер
+         можно переписать не трогая остальной код.
+- [x] 29. `analysis.py` — чистые функции без I/O: `pick_target`, `Detrender`,
+         `detect_breath`, `build_zone_patch`, константы. Без matplotlib/serial.
+- [x] 30. `state.py` — thread-safe буферы + `ingest(raw)` (выбор цели, детренд,
+         лог парсинга в кольцевой `log_lines`) + `analyze()` (FFT). Лог виден в UI.
+- [x] 31. `plots.py` — каждый график = класс-наследник `Panel` (`setup`/`update`);
+         `LAYOUT` = список (row,col,PanelClass). Добавить/удалить график = правка
+         LAYOUT. Добавлены панели: WavePlot, BreathPlot, HeatmapPlot, BarPlot,
+         StatsPanel, LogPanel (окно лога парсинга ESP32).
+- [x] 32. `app.py` — связка (поток чтения UART, сборка фигуры 3x2, анимация);
+         `monitor.py` — тонкая точка входа. `app._sync` ждёт баннер "ready".
+- [x] 33. Тесты обновлены: `test_pc_fft.py` импортирует `detect_breath` из analysis;
+         добавлен `test_protocol.py` (декодер). Все модули импортируются (проверено
+         заглушками тяжёлых зависимостей).
+- [x] 34. Каждая панель показывает ВСЕ цели (3 слота), а не одну выбранную:
+         `state.py` хранит историю по слотам (`depth/lateral/dist/ac/present[i]` +
+         3 `Detrender`); выбранный слот (`selected`) подсвечивается и идёт в
+         детекцию дыхания. WavePlot/BreathPlot — линии по целям (выбранная
+         толще), HeatmapPlot — маркер на каждую присутствующую цель + плотность
+         по всем, BarPlot — радиальная дистанция каждой цели, StatsPanel —
+         сводка по целям. Цвета целей в `analysis.TARGET_COLORS`.

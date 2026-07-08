@@ -2,7 +2,7 @@ import os
 os.environ.setdefault("MPLBACKEND", "Agg")
 
 import numpy as np
-import monitor as M
+from analysis import detect_breath
 
 
 def _signal(f_hz, amp, fs=10.0, dur=30.0, noise=0.0, seed=0):
@@ -17,7 +17,7 @@ def _signal(f_hz, amp, fs=10.0, dur=30.0, noise=0.0, seed=0):
 
 def test_15_bpm_detected():
     ts, ac = _signal(0.25, 8.0)
-    bpm, detected, quality, snr = M.detect_breath(ts, ac)
+    bpm, detected, quality, snr = detect_breath(ts, ac)
     assert detected, "breathing should be detected"
     assert abs(bpm - 15.0) < 3.0, f"bpm={bpm}"
     assert quality > 0
@@ -25,7 +25,7 @@ def test_15_bpm_detected():
 
 def test_30_bpm_detected():
     ts, ac = _signal(0.5, 6.0)
-    bpm, detected, quality, snr = M.detect_breath(ts, ac)
+    bpm, detected, quality, snr = detect_breath(ts, ac)
     assert detected
     assert abs(bpm - 30.0) < 4.0
 
@@ -33,7 +33,7 @@ def test_30_bpm_detected():
 def test_no_breath_flat():
     ts, ac = _signal(0.0, 0.0)
     ac = [0.0] * len(ac)
-    bpm, detected, quality, snr = M.detect_breath(ts, ac)
+    bpm, detected, quality, snr = detect_breath(ts, ac)
     assert not detected
     assert bpm == 0.0
 
@@ -41,5 +41,5 @@ def test_no_breath_flat():
 def test_low_snr_rejected():
     # Breathing present but drowned in noise -> should be rejected.
     ts, ac = _signal(0.25, 1.0, noise=20.0, seed=1)
-    bpm, detected, quality, snr = M.detect_breath(ts, ac)
+    bpm, detected, quality, snr = detect_breath(ts, ac)
     assert not detected
