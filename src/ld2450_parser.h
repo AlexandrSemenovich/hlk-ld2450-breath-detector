@@ -16,11 +16,6 @@ namespace ld2450 {
 static constexpr uint8_t  MAX_TARGETS = 3;
 static constexpr size_t   RX_CAPACITY = 64;
 
-#define ZONE_MAX_Y  3500   // Максимальная дальность прямо перед радаром (например, 3.5 метра)
-#define ZONE_MIN_Y  500    // Минимальная дальность (обычно 0)
-#define ZONE_MAX_X  2000   // Максимальное отклонение вправо (2 метра)
-#define ZONE_MIN_X -2000   // Максимальное отклонение влево (2 метра)
-
 struct Target {
   int16_t x;
   int16_t y;
@@ -56,8 +51,7 @@ class Parser {
   uint8_t  buf_[RX_CAPACITY];
   uint16_t len_ = 0;
 
-  static int16_t decodeCoord(uint16_t raw);
-  static int16_t decodeSpeed(uint16_t raw);
+  static int16_t decodeSigned(uint16_t raw);
 };
 
 }  // namespace ld2450

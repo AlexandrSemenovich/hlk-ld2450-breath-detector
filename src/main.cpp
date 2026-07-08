@@ -20,12 +20,6 @@ static ld2450::Parser parser;
 static uint32_t       last_frame_ms = 0;
 static uint32_t       frame_counter = 0;
 
-unsigned long startTime = 0; 
-unsigned long duration = 60000;
-bool isRunning  = true, start = true;
-
-// Transparent forwarder: parse radar frames and relay raw targets to the PC.
-// All target selection and breath detection is done on the PC side.
 static void pollRadar(uint32_t now) {
   if (parser.size() > 0 && (now - last_frame_ms) > FRAME_TIMEOUT_MS) {
     parser.reset();
@@ -45,22 +39,9 @@ static void pollRadar(uint32_t now) {
 void setup() {
   bridge::begin(PC_BAUD);
   radarSerial.begin(LD2450_BAUD, SERIAL_8N1, LD2450_RX_PIN, LD2450_TX_PIN);
-  Serial.println("ESP32 LD2450 Breath Detector - transparent target forwarder");
+  delay(3000);
 }
 
 void loop() {
-  if (start){
-    Serial.println("Start");
-    start = false;
-  }
-  
-  if (isRunning) {
-    if (millis() - startTime < duration) {
-      pollRadar(millis());  
-    } else {
-      isRunning = false;        // Время вышло, выключаем таймер
-      Serial.println("Stop");
-    }
-  }
-
+  pollRadar(millis());  
 }
