@@ -2,7 +2,7 @@
 // Bridge that streams raw radar target frames to the PC over the USB UART.
 // The ESP32 is a transparent forwarder: it only parses the LD2450 wire frame
 // and relays the raw targets. All target selection + breath analysis happens
-// on the PC (python/monitor.py). Keep this minimal — it must not block the loop.
+// on the PC (python/breath_monitor.py). Keep this minimal — it must not block the loop.
 
 #include <Arduino.h>
 #include "ld2450_parser.h"

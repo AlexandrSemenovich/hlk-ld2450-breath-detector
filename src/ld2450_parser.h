@@ -3,8 +3,10 @@
 // Real wire frame is a fixed 30 bytes:
 //   AA FF 03 00 (4) | 3 x [x(2) y(2) speed(2) distance_res(2)] (24) | 55 CC (2)
 // i.e. first target starts at offset 4; there is NO separate nTargets/reserved byte.
-//   x, y      : signed-magnitude int16 (magnitude = raw & 0x7FFF, sign in bit15), unit mm
-//   speed     : signed-magnitude int16 (sign in bit15), unit cm/s
+// Per the HLK-LD2450 datasheet, signed fields use signed-magnitude int16:
+//   magnitude = raw & 0x7FFF,  sign bit = bit15 (1 => positive, 0 => negative)
+//   x, y      : mm
+//   speed     : cm/s
 //   distance_res : uint16, distance gate size (mm); 0 means target absent
 // A missing/unused target slot is filled with all zeros (distance_res == 0).
 

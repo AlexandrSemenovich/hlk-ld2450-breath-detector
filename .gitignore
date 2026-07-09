@@ -4,7 +4,12 @@
 .vscode/launch.json
 .vscode/ipch
 .venv/
+venv/
 __pycache__/
+*.pyc
+python/.venv/
+python/__pycache__/
 *.bin
 *.elf
 *.map
+session_*.csv

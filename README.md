@@ -1,115 +1,142 @@
-# hlk-ld2450-breath-detector
+# HLK-LD2450 Detector
 
-Детектор дыхания человека на базе 24 ГГц радара **HLK-LD2450** и **ESP32**.
+A contactless human **breath-rate monitor** built on the 24 GHz mmWave radar
+module **HLK-LD2450** and an **ESP32**.
 
-Архитектура «прозрачный форвардер + весь анализ на ПК»:
+The ESP32 runs a tiny *transparent forwarder* firmware: it parses the raw radar
+frames over UART and relays the up-to-three tracked targets to a PC as a compact
+text stream. All breathing analysis (target selection, detrending,
+band-pass filtering, FFT, BPM / SNR estimation, apnea detection) happens on the
+PC in Python, where it is easy to visualise, log, and tune.
 
 ```
-HLK-LD2450 ──UART(256000)──> ESP32 ──USB CDC(921600)──> python/monitor.py (Python)
-   (кадры)     парсинг+ретрансляция    (raw x,y,spd,res)   (выбор цели +
-                                                                 band-pass/FFT/апноэ)
+HLK-LD2450 ──UART(256000)──> ESP32 ──USB CDC(921600)──> python/breath_monitor.py
+   (radar frames)   parse + relay      "R" lines          (analysis + live plot)
 ```
 
-ESP32 — **прозрачный форвардер**: он только парсит кадры радара и
-ретранслирует сырые цели (x, y, speed, distance_res) по 3 штуки на кадр.
-Вся логика — выбор стационарной цели в зоне, детренд радиальной дистанции,
-полосовая фильтрация, спектральный анализ, оценка SNR/качества и детекция
-апноэ — выполняется на ПК в `python/monitor.py`.
+## Features
 
-## Аппаратная часть
-- LD2450: 5V, UART 256000 8N1, выход уровня 3.3V. По умолчанию 10 кадров/с.
-- Подключение к ESP32: RX радара <- TX ESP32 (pin 33), TX радара -> RX ESP32 (pin 32).
-- Рекомендуемая высота крепления 1.5–2 м, антенна смотрит в зону отслеживания.
+- Minimal, dependency-free ESP32 firmware (Arduino / PlatformIO).
+- Accurate LD2450 wire-frame parser (header `AA FF 03 00` … tail `55 CC`),
+  signed-magnitude decoding per the HLK datasheet.
+- Robust text protocol with a frame id so the PC can detect dropped frames.
+- Reference PC tool with live matplotlib visualisation, CSV logging, and a
+  breathing-rate / SNR / apnea estimator.
+- Pure, unit-tested analysis functions (`pick_target`, `detect_breath`).
 
-## Протокол (USB CDC, текст, одна строка на кадр радара)
-```
-R<x0>,<y0>,<spd0>,<res0>,<x1>,<y1>,<spd1>,<res1>,<x2>,<y2>,<spd2>,<res2>,<ts_ms>,<frame_id>
-```
-- `R` — на каждый кадр радара (всегда 3 цели, даже если слоты пустые):
-  - `x`, `y` — координаты цели, мм (латераль/продольная), со знаком
-  - `spd` — радиальная скорость, cm/s, со знаком
-  - `res` — разрешение дистанции (uint16, мм); `res == 0` ⇒ слот пустой
-  - `ts_ms` — `millis()` на ESP32
-  - `frame_id` — монотонный счётчик кадров (позволяет детектить дропы)
-- На ПК из сырых целей считается `radial = sqrt(x²+y²)` и выбирается
-  стационарная цель в зоне (см. `pick_target` в `python/monitor.py`).
+> **Disclaimer:** this is an experimental hobby project, **not a medical
+> device**. Do not use it for health, safety, or clinical decisions.
 
-Префикс `R` позволяет ПК однозначно демультиплексировать поток.
+## Hardware
 
-## Конвенция координат
-- `x` — поперечная (латеральная) ось, мм, со знаком
-- `y` — продольная (вперёд от радара) ось, мм
-- `depth` = `radial` = `sqrt(x² + y²)` — ось дыхания (грудь движется вдоль r)
-- `lateral` = `x` — только для зоны/тепловой карты
-- зона детекции: `ZONE_R_MIN(600) ≤ radial ≤ ZONE_R_MAX(2500)` и `|x| ≤ ZONE_SIDE_MAX(500)`
+| Part      | Notes                                                        |
+|-----------|-------------------------------------------------------------|
+| HLK-LD2450 | 24 GHz mmWave radar, 5 V supply, 3.3 V UART IO, 256000 8N1 |
+| ESP32      | Any ESP32 dev board (tested on a generic `esp32dev`)        |
 
-## Сборка и прошивка (ESP32)
-Требуется [PlatformIO](https://platformio.org/).
+Wire the radar to the ESP32 (crossed TX/RX):
+
+| LD2450 | ESP32        | Signal            |
+|--------|--------------|-------------------|
+| 5V     | 5V           | power             |
+| GND    | GND          | ground            |
+| TX     | GPIO32 (RX)  | radar → ESP32     |
+| RX     | GPIO33 (TX)  | ESP32 → radar     |
+
+Mount the radar 1.5–2 m above the subject, antenna pointing at the monitored
+area. The default zone (configurable in `python/breath_monitor.py`) is a ring
+`600 mm ≤ radial ≤ 2500 mm` with `|x| ≤ 500 mm`.
+
+## Firmware build & flash
+
+Requires [PlatformIO](https://platformio.org/).
+
 ```bash
-pio run -t upload          # прошивка
+pio run              # build
+pio run -t upload    # flash (set upload port in platformio.ini or via --upload-port)
 pio device monitor -b 921600
 ```
 
-## Запуск монитора (ПК)
-Вся работа с Python — в папке `python/`.
+On boot the firmware prints a one-line protocol banner, then streams one `R`
+line per radar frame (~10 Hz).
+
+## Serial protocol
+
+One ASCII line per radar frame, newline terminated:
+
+```
+R<x0>,<y0>,<spd0>,<res0>,<x1>,<y1>,<spd1>,<res1>,<x2>,<y2>,<spd2>,<res2>,<ts_ms>,<frame_id>
+```
+
+| Field     | Type        | Unit  | Meaning                                            |
+|-----------|-------------|-------|----------------------------------------------------|
+| `x`, `y`  | int16 (s.m.)| mm    | lateral / longitudinal target coordinate          |
+| `spd`     | int16 (s.m.)| cm/s  | radial speed (sign = direction)                    |
+| `res`     | uint16      | mm    | distance-gate size; **`0` ⇒ slot empty**           |
+| `ts_ms`   | uint32      | ms    | `millis()` timestamp on the ESP32                  |
+| `frame_id`| uint32      | —     | monotonic counter (detects dropped frames)         |
+
+`s.m.` = signed-magnitude, sign bit = bit15 (1 → positive). Three target slots
+are always emitted; an empty slot has `res == 0` (and `x = y = spd = 0`).
+
+Coordinate convention: `x` is lateral, `y` is the forward (longitudinal) axis.
+The breath axis is `radial = sqrt(x² + y²)`.
+
+## PC tool
+
+All PC code lives in [`python/`](python/).
+
 ```bash
 cd python
+python -m venv .venv && source .venv/bin/activate   # optional
 pip install -r requirements.txt
-python monitor.py COM3 921600      # или просто python monitor.py (автопоиск порта)
+
+# auto-detect the serial port, or pass it explicitly:
+python breath_monitor.py            # auto-detect
+python breath_monitor.py COM3 921600
+python breath_monitor.py /dev/ttyUSB0
 ```
-Backend matplotlib можно переопределить через переменную окружения:
+
+What it does:
+
+1. Reads the serial port in a background thread into a thread-safe buffer.
+2. `pick_target` selects the most stationary in-zone target each frame.
+3. Detrends the radial distance (slow EMA high-pass) → AC breathing signal.
+4. Resamples to a uniform grid using `ts_ms`, then band-pass filters
+   (Butterworth, 0.12–0.5 Hz ≈ 7–30 breaths/min).
+5. FFT → dominant peak in band → `BPM = f · 60`; SNR vs. the rest of the band.
+6. Flags apnea when no confident peak is found for > 15 s.
+7. Live plot + CSV logging (`--out session.csv`) for offline analysis.
+
+Override the matplotlib backend if needed:
+
 ```bash
-set MPLBACKEND=QtAgg     # Windows
-MPLBACKEND=QtAgg python monitor.py /dev/ttyUSB0
+MPLBACKEND=QtAgg python breath_monitor.py /dev/ttyUSB0
 ```
 
-### Что делает monitor.py
-1. Читает сериал в фоновом потоке (thread-safe буфер).
-2. `pick_target` — выбор стационарной цели в зоне (radial = √(x²+y²)).
-3. Детренд радиальной дистанции (low-pass EMA + slow high-pass) → AC-сигнал.
-4. Resample AC на равномерную сетку по `ts_ms` радара.
-5. Полосовой фильтр Баттерворта 0.12–0.5 Гц (дыхание ≈ 7–30 вдох/мин).
-6. FFT → поиск пика в полосе → BPM = f·60.
-7. SNR относительно остальной полосы → качество и порог детекции.
-8. Апноэ: отсутствие достоверного пика > 15 с.
-Тепловая карта строится по `lateral = x` и `depth = radial`.
-
-## Тесты
-```bash
-cd python
-pytest tests/              # Python тест PC-конвейера и детектора на синтетике
-```
-C++-тест детектора (`cpp_test/`) удалён — алгоритм теперь целиком на ПК
-(`python/tests/test_pc_fft.py`), а `src/breath_detector.*` больше не используется ESP32.
-
-## Структура папки `python/`
-
-Скрипт разбит на модули, чтобы функции было легко добавлять/менять:
+## Project layout
 
 ```
+src/
+  main.cpp          # ESP32 firmware: read radar, relay targets over USB CDC
+  ld2450_parser.h/.cpp  # LD2450 wire-frame parser
+  radar_bridge.h    # serial relay ("R" protocol) + banner
 python/
-  monitor.py          # точка входа: python monitor.py [PORT] [BAUD]
-  app.py              # связка: поток чтения UART, сборка фигуры, анимация
-  protocol.py         # декодер протокола (ЕДИНСТВЕННОЕ место, знающее формат R-строки)
-  analysis.py         # чистые функции: pick_target, Detrender, detect_breath, build_zone_patch
-  state.py            # thread-safe буферы, выбор цели, лог парсинга
-  plots.py            # панели графиков (каждая — свой класс) + LAYOUT
-  tests/
-    test_pc_fft.py    # тесты detect_breath (синтетика)
-    test_protocol.py  # тесты декодера protocol.decode_line
+  breath_monitor.py # PC tool: decode, analyse, plot, log
+  requirements.txt
+  tests/            # unit tests for protocol + analysis
+doc/
+  006000_HLK-LD2450-Instruction-Manual.pdf
 ```
 
-Расширение:
-- **Новый протокол/парсер** — перепиши `protocol.decode_line` (или добавь функцию),
-  остальной код формат строки не знает.
-- **Новый график** — добавь класс-наследник `plots.Panel` (`setup(ax)`/`update(state)`)
-  и допиши кортеж в `plots.LAYOUT`. Удалить график = убрать кортеж.
-- **Новая метрика/логика** — допиши в `analysis.py` / `state.py`.
-- Окно лога (правый нижний угол) показывает, как распарсилось каждое сообщение ESP32.
+## Limitations
 
-## Ограничения
-LD2450 — трекер *движущихся* целей; разрешение по дистанции грубое
-(`distance_res` ~320 мм в примере datasheet). Амплитуда дыхания (~5–15 мм)
-сопоставима с шумом трекера, поэтому ожидайте низкий SNR. Для устойчивой
-работы: брать только стационарную цель в зоне, агрессивный полосовой фильтр
-и оценку SNR/качества перед выдачей результата.
+The LD2450 is a *moving-target* tracker; its distance resolution is coarse
+(`distance_res` ≈ 320 mm per the datasheet), and breath amplitude (~5–15 mm)
+is comparable to tracker noise, so expect a low SNR. For stable results: track
+only a stationary in-zone target, use an aggressive band-pass, and gate results
+on the SNR / quality estimate before trusting the BPM.
+
+## License
+
+[MIT](LICENSE) — see `LICENSE`.

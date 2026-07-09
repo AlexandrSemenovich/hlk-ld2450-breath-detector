@@ -13,8 +13,9 @@ void Parser::feed(uint8_t b) {
 }
 
 int16_t Parser::decodeSigned(uint16_t raw) {
+    // Signed-magnitude: bit15 is the sign (1 => positive, 0 => negative).
     const int16_t mag = static_cast<int16_t>(raw & 0x7FFF);
-    return (raw & 0x8000) ? mag : -mag;
+    return (raw & 0x8000) ? mag : static_cast<int16_t>(-mag);
 }
 
 bool Parser::drain(Frame& out) {
@@ -32,12 +33,14 @@ bool Parser::drain(Frame& out) {
     const uint16_t o = 4 + i * 8;
     Target& t = out.targets[i];
 
+    t.index = i;
     t.x = decodeSigned(buf_[o] | (buf_[o+1] << 8));
     t.y = decodeSigned(buf_[o+2] | (buf_[o+3] << 8));
     t.speed = decodeSigned(buf_[o+4] | (buf_[o+5] << 8));
     t.distance_res = buf_[o+6] | (buf_[o+7] << 8);
 
-    if (t.x != 0 || t.y != 0 || t.distance_res != 0) {  // или другой критерий
+    // A target slot is "present" only when distance_res != 0 (datasheet).
+    if (t.distance_res != 0) {
       out.count++;
     }
   }
